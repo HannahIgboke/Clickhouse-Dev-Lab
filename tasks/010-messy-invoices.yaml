@@ -1,0 +1,180 @@
+id: 10
+slug: messy-invoices
+title: Clean a messy CSV while loading it
+domains: [inserting, modeling]
+objectives: [I1, I3, I4, M3]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/interfaces/formats/CSV
+  - https://clickhouse.com/docs/operations/settings/formats#format_csv_delimiter
+  - https://clickhouse.com/docs/sql-reference/functions/type-conversion-functions#parsedatetimebesteffort
+  - https://clickhouse.com/docs/sql-reference/functions/date-time-functions#parsedatetime
+
+brief: |
+  Finance exported invoices to /data/invoices.csv. It has a header row, but:
+
+    - fields are separated by semicolons (;), not commas
+    - issued is a European date: dd/mm/yyyy (03/04/2025 is 3 April)
+    - customer_email is in random case
+    - currency has stray spaces and mixed case (' ngn', 'Usd ')
+    - paid is 'Y' or 'N'
+    - paid_at is 'yyyy-mm-dd hh:mm:ss', or the text NULL when unpaid
+
+  The table billing.invoices already exists:
+
+    invoice_id UInt32, issued Date, customer_email String,
+    currency LowCardinality(String), amount Decimal(12, 2),
+    paid Bool, paid_at Nullable(DateTime)
+
+  Load every invoice into billing.invoices, converting as you go: issued as a
+  proper Date, emails in lowercase, currency trimmed and in uppercase (NGN,
+  USD...), paid as true/false, and paid_at as a real NULL when unpaid.
+
+reset:
+  - DROP DATABASE IF EXISTS billing SYNC
+
+setup:
+  - CREATE DATABASE billing
+  - |
+    CREATE TABLE billing.invoices
+    (
+        invoice_id     UInt32,
+        issued         Date,
+        customer_email String,
+        currency       LowCardinality(String),
+        amount         Decimal(12, 2),
+        paid           Bool,
+        paid_at        Nullable(DateTime)
+    )
+    ENGINE = MergeTree
+    ORDER BY invoice_id
+
+files:
+  - path: invoices.csv
+    format: CSVWithNames
+    query: |
+      SELECT invoice_id, formatDateTime(issued_d, '%d/%m/%Y') AS issued, customer_email, currency, amount, paid, paid_at
+      FROM
+      (
+          SELECT
+              toUInt32(number + 1000) AS invoice_id,
+              toDate('2025-01-01') + (cityHash64(number, {seed}, 1) % 270) AS issued_d,
+              if(cityHash64(number, {seed}, 2) % 2 = 0, upper(e), e) AS customer_email,
+              [' ngn', 'NGN', 'Usd ', 'usd', ' EUR ', 'gbp'][1 + (cityHash64(number, {seed}, 3) % 6)] AS currency,
+              toString(round(10 + (cityHash64(number, {seed}, 4) % 500000) / 100, 2)) AS amount,
+              if(cityHash64(number, {seed}, 5) % 3 = 0, 'N', 'Y') AS paid,
+              if(paid = 'Y', formatDateTime(toDateTime(issued_d) + 3600 + (cityHash64(number, {seed}, 6) % (20 * 86400)), '%Y-%m-%d %H:%i:%S'), 'NULL') AS paid_at,
+              concat('Client', toString(cityHash64(number, {seed}, 7) % 3000), '@Example.com') AS e
+          FROM numbers(50000)
+      )
+      SETTINGS format_csv_delimiter = ';'
+
+checks:
+  - name: All 50,000 invoices loaded once
+    type: sql_true
+    points: 15
+    query: SELECT count() = 50000 AND uniqExact(invoice_id) = 50000 FROM billing.invoices
+    show: SELECT concat(toString(count()), ' rows, ', toString(uniqExact(invoice_id)), ' distinct ids') FROM billing.invoices
+    hint: The file uses ; as its delimiter. Tell ClickHouse with SETTINGS format_csv_delimiter = ';'.
+
+  - name: issued dates read day-first (dd/mm/yyyy)
+    type: result
+    points: 25
+    query: SELECT groupBitXor(cityHash64(invoice_id, issued)) AS fp, min(issued) AS lo, max(issued) AS hi FROM billing.invoices
+    expect: |
+      SELECT groupBitXor(cityHash64(invoice_id, parseDateTime(issued, '%d/%m/%Y')::Date)) AS fp,
+             min(parseDateTime(issued, '%d/%m/%Y')::Date) AS lo, max(parseDateTime(issued, '%d/%m/%Y')::Date) AS hi
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';'
+    hint: >-
+      parseDateTime(issued, '%d/%m/%Y') is unambiguous. parseDateTimeBestEffortUS reads 03/04 as
+      March 4, which is wrong here.
+
+  - name: Emails lowercase, currencies trimmed and uppercase
+    type: result
+    points: 20
+    query: |
+      SELECT groupBitXor(cityHash64(invoice_id, customer_email, toString(currency))) AS fp,
+             arraySort(groupUniqArray(toString(currency))) AS currencies
+      FROM billing.invoices
+    expect: |
+      SELECT groupBitXor(cityHash64(invoice_id, lower(customer_email), upper(trimBoth(currency)))) AS fp,
+             arraySort(groupUniqArray(upper(trimBoth(currency)))) AS currencies
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';'
+
+  - name: paid is Bool and paid_at is NULL exactly when unpaid
+    type: result
+    points: 25
+    query: |
+      SELECT countIf(paid) AS paid, countIf(paid_at IS NULL) AS nulls,
+             groupBitXor(cityHash64(invoice_id, ifNull(toString(paid_at), 'NULL'))) AS fp
+      FROM billing.invoices
+    expect: |
+      SELECT countIf(paid = 'Y') AS paid, countIf(paid_at = 'NULL') AS nulls,
+             groupBitXor(cityHash64(invoice_id, if(paid_at = 'NULL', 'NULL', paid_at))) AS fp
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';'
+    hint: paid = 'Y' gives a Bool; nullIf(paid_at, 'NULL') turns the text into a real NULL before converting.
+
+  - name: Amounts exact
+    type: result
+    points: 15
+    query: SELECT sum(amount) AS total FROM billing.invoices
+    expect: |
+      SELECT sum(amount) AS total
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';'
+
+solution: |
+  -- Look first. Plain inference would read paid_at as DateTime and fail on the text NULL,
+  -- so ask for every column as String while exploring.
+  SELECT * FROM file('invoices.csv', 'CSVWithNames') LIMIT 3
+  SETTINGS format_csv_delimiter = ';', input_format_csv_use_best_effort_in_schema_inference = 0;
+
+  INSERT INTO billing.invoices
+  SELECT
+      invoice_id,
+      parseDateTime(issued, '%d/%m/%Y')::Date,
+      lower(customer_email),
+      upper(trimBoth(currency)),
+      amount,
+      paid = 'Y',
+      parseDateTimeOrNull(nullIf(paid_at, 'NULL'), '%Y-%m-%d %H:%i:%S')
+  FROM file('invoices.csv', 'CSVWithNames',
+            'invoice_id UInt32, issued String, customer_email String, currency String,
+             amount Decimal(12, 2), paid String, paid_at String')
+  SETTINGS format_csv_delimiter = ';';
+
+alternatives:
+  - name: best-effort parsing, if(), INFILE with input()-style transform
+    sql: |
+      INSERT INTO billing.invoices
+      SELECT invoice_id, toDate(parseDateTimeBestEffort(issued)), lowerUTF8(customer_email),
+             upper(trim(currency)), toDecimal64(amount, 2), if(paid = 'Y', true, false),
+             if(paid_at = 'NULL', NULL, toDateTime(paid_at))
+      FROM file('invoices.csv', 'CSVWithNames',
+                'invoice_id UInt32, issued String, customer_email String, currency String, amount String, paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';';
+
+wrong_solutions:
+  - name: US date parsing, no cleanup
+    must_fail:
+      - issued dates read day-first (dd/mm/yyyy)
+      - Emails lowercase, currencies trimmed and uppercase
+    sql: |
+      INSERT INTO billing.invoices
+      SELECT invoice_id, toDate(parseDateTimeBestEffortUS(issued)), customer_email, currency, amount,
+             paid = 'Y', parseDateTimeOrNull(nullIf(paid_at, 'NULL'), '%Y-%m-%d %H:%i:%S')
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';';
+  - name: NULL text left as a placeholder date
+    must_fail:
+      - paid is Bool and paid_at is NULL exactly when unpaid
+    sql: |
+      INSERT INTO billing.invoices
+      SELECT invoice_id, parseDateTime(issued, '%d/%m/%Y')::Date, lower(customer_email), upper(trimBoth(currency)), amount,
+             paid = 'Y', parseDateTimeBestEffortOrZero(paid_at)
+      FROM file('invoices.csv', 'CSVWithNames', 'invoice_id UInt32, issued String, customer_email String, currency String, amount Decimal(12, 2), paid String, paid_at String')
+      SETTINGS format_csv_delimiter = ';';

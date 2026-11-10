@@ -1,0 +1,112 @@
+id: 9
+slug: cdn-glob
+title: Load one quarter of monthly files from S3
+domains: [inserting]
+objectives: [I2, I3, I4]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/table-functions/s3
+  - https://clickhouse.com/docs/sql-reference/table-functions/file#globs-in-path
+  - https://clickhouse.com/docs/sql-reference/table-functions/s3#virtual-columns
+
+brief: |
+  CDN logs are stored as one gzipped CSV file (with a header row) per month
+  of 2025:
+
+    {s3}/cdn/logs/2025-01.csv.gz ... {s3}/cdn/logs/2025-12.csv.gz
+    Access key: {s3_key}    Secret key: {s3_secret}
+
+  The table cdn.requests already exists with the columns
+  ts, edge, bytes, status, source_file.
+
+  Load only the second quarter (the April, May and June files) into
+  cdn.requests. Fill source_file with the name of the file each row came
+  from, for example 2025-05.csv.gz.
+
+reset:
+  - DROP DATABASE IF EXISTS cdn SYNC
+
+setup:
+  - CREATE DATABASE cdn
+  - |
+    CREATE TABLE cdn.requests
+    (
+        ts          DateTime,
+        edge        LowCardinality(String),
+        bytes       UInt64,
+        status      UInt16,
+        source_file LowCardinality(String)
+    )
+    ENGINE = MergeTree
+    ORDER BY (edge, ts)
+  - |
+    INSERT INTO FUNCTION s3('{s3}/cdn/logs/2025-{_partition_id}.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames')
+    PARTITION BY formatDateTime(ts, '%m')
+    SELECT
+        toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 1) % (365 * 86400)) AS ts,
+        ['LOS', 'ACC', 'NBO', 'JNB', 'LHR', 'FRA', 'IAD', 'SIN'][1 + (cityHash64(number, {seed}, 2) % 8)] AS edge,
+        toUInt64(200 + cityHash64(number, {seed}, 3) % 5000000) AS bytes,
+        [200, 200, 200, 206, 304, 404, 500][1 + (cityHash64(number, {seed}, 4) % 7)] AS status
+    FROM numbers(240000)
+
+checks:
+  - name: Exactly the April, May and June files were loaded
+    type: sql_true
+    points: 35
+    query: |
+      SELECT groupArray(f) = ['2025-04.csv.gz', '2025-05.csv.gz', '2025-06.csv.gz']
+      FROM (SELECT DISTINCT toString(source_file) AS f FROM cdn.requests ORDER BY f)
+    show: SELECT DISTINCT toString(source_file) FROM cdn.requests ORDER BY 1
+    hint: >-
+      Globs in the path pick files: 2025-{04..06}.csv.gz or 2025-0{4,5,6}.csv.gz.
+      The virtual column _file holds each row's file name.
+
+  - name: Every row of those files, each tagged with its file
+    type: result
+    points: 45
+    query: |
+      SELECT count() AS rows, sum(bytes) AS bytes, groupBitXor(cityHash64(ts, toString(edge), status, toString(source_file))) AS fp
+      FROM cdn.requests
+    expect: |
+      SELECT count() AS rows, sum(bytes) AS bytes, groupBitXor(cityHash64(ts, edge, status, _file)) AS fp
+      FROM s3('{s3}/cdn/logs/2025-*.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames',
+              'ts DateTime, edge String, bytes UInt64, status UInt16')
+      WHERE _file IN ('2025-04.csv.gz', '2025-05.csv.gz', '2025-06.csv.gz')
+
+  - name: No rows outside April-June
+    type: sql_true
+    points: 20
+    query: SELECT count() > 0 AND countIf(toMonth(ts) NOT IN (4, 5, 6)) = 0 FROM cdn.requests
+
+solution: |
+  SELECT _file, count() FROM s3('{s3}/cdn/logs/*.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames')
+  GROUP BY _file ORDER BY _file;
+
+  INSERT INTO cdn.requests
+  SELECT ts, edge, bytes, status, _file AS source_file
+  FROM s3('{s3}/cdn/logs/2025-{04..06}.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames');
+
+alternatives:
+  - name: list glob and explicit structure
+    sql: |
+      INSERT INTO cdn.requests (ts, edge, bytes, status, source_file)
+      SELECT ts, edge, bytes, status, _file
+      FROM s3('{s3}/cdn/logs/2025-0{4,5,6}.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames',
+              'ts DateTime, edge String, bytes UInt64, status UInt16');
+
+wrong_solutions:
+  - name: every month loaded
+    must_fail:
+      - Exactly the April, May and June files were loaded
+      - No rows outside April-June
+    sql: |
+      INSERT INTO cdn.requests SELECT ts, edge, bytes, status, _file
+      FROM s3('{s3}/cdn/logs/*.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames');
+  - name: full path instead of file name
+    must_fail:
+      - Exactly the April, May and June files were loaded
+      - Every row of those files, each tagged with its file
+    sql: |
+      INSERT INTO cdn.requests SELECT ts, edge, bytes, status, _path
+      FROM s3('{s3}/cdn/logs/2025-{04..06}.csv.gz', '{s3_key}', '{s3_secret}', 'CSVWithNames');

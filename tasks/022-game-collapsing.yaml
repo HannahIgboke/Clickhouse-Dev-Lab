@@ -1,0 +1,142 @@
+id: 22
+slug: game-collapsing
+title: Read and update a CollapsingMergeTree table
+domains: [dedup, analyzing]
+objectives: [D3, A1, A3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/collapsingmergetree
+  - https://clickhouse.com/docs/guides/developer/deduplication
+
+brief: |
+  game.players is a CollapsingMergeTree(sign) table sorted by player_id with
+  the columns player_id, level, coins, sign. Every change to a player was
+  written as a cancel row (sign = -1, a copy of the old state) plus a new
+  state row (sign = 1). Background merges are paused, so old and cancelled
+  rows are still physically present.
+
+  1. Player 777 just spent 500 coins (the level does not change). Record this
+  the CollapsingMergeTree way. Do not use ALTER TABLE ... UPDATE or DELETE
+  (with merges paused, such a mutation would never finish anyway).
+
+  2. Create a view answers.rich_players with columns player_id and coins
+  listing every player whose current coins are 10000 or more, most coins
+  first (ties by player_id). It must be correct even though parts are not
+  merged.
+
+reset:
+  - DROP DATABASE IF EXISTS game SYNC
+  - DROP DATABASE IF EXISTS chlab_truth_t22 SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.rich_players SYNC
+
+setup:
+  - CREATE DATABASE game
+  - CREATE DATABASE chlab_truth_t22
+  - |
+    CREATE TABLE game.players (player_id UInt64, level UInt16, coins UInt32, sign Int8)
+    ENGINE = CollapsingMergeTree(sign) ORDER BY player_id
+  - SYSTEM STOP MERGES game.players
+  - |
+    INSERT INTO game.players
+    SELECT number + 1, toUInt16(1 + cityHash64(number, {seed}, 1) % 50), toUInt32(cityHash64(number, {seed}, 2) % 15000), 1
+    FROM numbers(20000) WHERE number + 1 != 777
+  - INSERT INTO game.players VALUES (777, 12, 12345, 1)
+  - |
+    INSERT INTO game.players
+    SELECT player_id, level, coins, -1 FROM game.players WHERE cityHash64(player_id, {seed}, 3) % 10 < 3 AND player_id != 777
+  - |
+    INSERT INTO game.players
+    SELECT player_id, level + 1, toUInt32(coins + 3000 + cityHash64(player_id, {seed}, 4) % 2000), 1
+    FROM game.players WHERE sign = -1
+  - INSERT INTO game.players VALUES (777, 12, 12345, -1), (777, 13, 12345, 1)
+  - |
+    CREATE TABLE chlab_truth_t22.p777 ENGINE = MergeTree ORDER BY tuple() AS
+    SELECT sum(coins * sign) AS coins, sum(level * sign) AS level FROM game.players WHERE player_id = 777
+
+checks:
+  - name: No ALTER mutations on game.players (rows inserted instead)
+    type: sql_true
+    points: 10
+    query: |
+      SELECT count() = 0 AND (SELECT count() FROM game.players WHERE player_id = 777) > 3
+      FROM system.mutations WHERE database = 'game' AND table = 'players'
+    show: SELECT command FROM system.mutations WHERE database = 'game' AND table = 'players'
+
+  - name: Player 777 now has 500 fewer coins, same level, one live state
+    type: sql_true
+    points: 35
+    query: |
+      SELECT sum(sign) = 1 AND sum(coins * sign) = (SELECT coins FROM chlab_truth_t22.p777) - 500
+             AND sum(level * sign) = (SELECT level FROM chlab_truth_t22.p777)
+      FROM game.players WHERE player_id = 777
+    show: |
+      SELECT concat('live states ', toString(sum(sign)), ', coins ', toString(sum(coins * sign)), ', level ', toString(sum(level * sign)))
+      FROM game.players WHERE player_id = 777
+    hint: >-
+      Insert a cancel row that copies the current state exactly with sign = -1, and a new state row with sign = 1:
+      INSERT INTO game.players VALUES (777, <level>, <old coins>, -1), (777, <level>, <old coins - 500>, 1).
+      Within one INSERT the cancel row must come before the new state, or ClickHouse collapses them together.
+
+  - name: answers.rich_players has columns player_id, coins
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['player_id', 'coins']
+      FROM (SELECT name FROM system.columns WHERE database = 'answers' AND table = 'rich_players' ORDER BY position)
+
+  - name: Rich players computed from current state only
+    type: result
+    points: 45
+    query: SELECT toUInt64(player_id) AS p, toInt64(coins) AS c FROM answers.rich_players
+    expect: |
+      SELECT toUInt64(player_id) AS p, toInt64(sum(coins * sign)) AS c FROM game.players
+      GROUP BY player_id HAVING sum(sign) > 0 AND c >= 10000
+      ORDER BY c DESC, p
+    hint: >-
+      Collapse at query time: GROUP BY player_id with sum(coins * sign), keeping groups where sum(sign) > 0.
+      (SELECT ... FROM game.players FINAL also works, but is slower on big tables.)
+
+solution: |
+  -- Current state of player 777
+  SELECT player_id, sum(level * sign) AS level, sum(coins * sign) AS coins
+  FROM game.players WHERE player_id = 777 GROUP BY player_id HAVING sum(sign) > 0;
+
+  -- It shows level 13 and 12345 coins: cancel exactly that state, then write the new one.
+  INSERT INTO game.players VALUES (777, 13, 12345, -1), (777, 13, 11845, 1);
+
+  CREATE VIEW answers.rich_players AS
+  SELECT player_id, sum(coins * sign) AS coins
+  FROM game.players
+  GROUP BY player_id
+  HAVING sum(sign) > 0 AND coins >= 10000
+  ORDER BY coins DESC, player_id;
+
+alternatives:
+  - name: staged current state, two INSERTs, FINAL in the view
+    sql: |
+      CREATE TABLE game.tmp_777 ENGINE = Memory AS SELECT player_id, level, coins FROM game.players FINAL WHERE player_id = 777;
+      INSERT INTO game.players SELECT player_id, level, coins, -1 FROM game.tmp_777;
+      INSERT INTO game.players SELECT player_id, level, coins - 500, 1 FROM game.tmp_777;
+      DROP TABLE game.tmp_777;
+      CREATE VIEW answers.rich_players AS
+      SELECT player_id, coins FROM game.players FINAL WHERE coins >= 10000 ORDER BY coins DESC, player_id;
+
+wrong_solutions:
+  - name: ALTER UPDATE, view ignores sign
+    must_fail:
+      - No ALTER mutations on game.players (rows inserted instead)
+      - Rich players computed from current state only
+    sql: |
+      ALTER TABLE game.players UPDATE coins = coins - 500 WHERE player_id = 777 AND sign = 1;
+      CREATE VIEW answers.rich_players AS
+      SELECT player_id, coins FROM game.players WHERE coins >= 10000 ORDER BY coins DESC, player_id;
+  - name: new state written without cancelling the old one
+    must_fail:
+      - Player 777 now has 500 fewer coins, same level, one live state
+    sql: |
+      INSERT INTO game.players VALUES (777, 13, 11845, 1);
+      CREATE VIEW answers.rich_players AS
+      SELECT player_id, sum(coins * sign) AS coins FROM game.players GROUP BY player_id
+      HAVING sum(sign) > 0 AND coins >= 10000 ORDER BY coins DESC, player_id;

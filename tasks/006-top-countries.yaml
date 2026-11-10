@@ -1,0 +1,115 @@
+id: 6
+slug: top-countries
+title: Top five countries by revenue
+domains: [analyzing]
+objectives: [A1, A3]
+tier: 1
+minutes: 6
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/select/group-by
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/sum
+
+brief: |
+  The table sales.orders holds orders from 2024 and 2025 (columns: order_id,
+  country, amount, status, created_at).
+
+  Create a view answers.top_countries that returns the five countries with
+  the highest revenue from orders with status 'completed' created in the
+  year 2025, highest revenue first, with exactly these columns:
+
+    country   the country
+    orders    the number of those orders
+    revenue   the sum of their amount
+
+reset:
+  - DROP DATABASE IF EXISTS sales SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.top_countries SYNC
+
+setup:
+  - CREATE DATABASE sales
+  - |
+    CREATE TABLE sales.orders
+    (
+        order_id   UInt64,
+        country    LowCardinality(String),
+        amount     Decimal(10, 2),
+        status     LowCardinality(String),
+        created_at DateTime
+    )
+    ENGINE = MergeTree
+    ORDER BY (created_at, order_id)
+  - |
+    INSERT INTO sales.orders
+    SELECT
+        number + 1,
+        ['NG', 'GH', 'KE', 'ZA', 'EG', 'US', 'GB', 'DE', 'FR', 'IN', 'BR', 'JP'][1 + (cityHash64(number, {seed}, 1) % 12)],
+        toDecimal64(round(5 + (cityHash64(number, {seed}, 2) % 50000) / 100, 2), 2),
+        ['completed', 'completed', 'completed', 'cancelled', 'refunded', 'pending'][1 + (cityHash64(number, {seed}, 3) % 6)],
+        toDateTime('2024-01-01 00:00:00') + (cityHash64(number, {seed}, 4) % (730 * 86400))
+    FROM numbers(200000)
+
+checks:
+  - name: answers.top_countries is a view with columns country, orders, revenue
+    type: sql_true
+    points: 15
+    query: |
+      SELECT (SELECT engine FROM system.tables WHERE database = 'answers' AND name = 'top_countries') = 'View'
+         AND (SELECT groupArray(name) FROM (SELECT name FROM system.columns
+              WHERE database = 'answers' AND table = 'top_countries' ORDER BY position)) = ['country', 'orders', 'revenue']
+    show: SELECT name FROM system.columns WHERE database = 'answers' AND table = 'top_countries' ORDER BY position
+
+  - name: Correct five countries, highest revenue first
+    type: result
+    points: 45
+    query: SELECT toString(country) AS c FROM answers.top_countries
+    expect: |
+      SELECT toString(country) AS c FROM sales.orders
+      WHERE status = 'completed' AND toYear(created_at) = 2025
+      GROUP BY country ORDER BY sum(amount) DESC LIMIT 5
+    hint: Filter on status and year, GROUP BY country, ORDER BY revenue DESC, LIMIT 5.
+
+  - name: orders and revenue are right for each country
+    type: result
+    points: 40
+    ordered: false
+    query: SELECT toString(country) AS c, orders, toFloat64(revenue) AS r FROM answers.top_countries
+    expect: |
+      SELECT toString(country) AS c, count() AS orders, toFloat64(sum(amount)) AS r FROM sales.orders
+      WHERE status = 'completed' AND toYear(created_at) = 2025
+      GROUP BY country ORDER BY sum(amount) DESC LIMIT 5
+
+solution: |
+  CREATE VIEW answers.top_countries AS
+  SELECT country, count() AS orders, sum(amount) AS revenue
+  FROM sales.orders
+  WHERE status = 'completed' AND toYear(created_at) = 2025
+  GROUP BY country
+  ORDER BY revenue DESC
+  LIMIT 5;
+
+alternatives:
+  - name: date range and countIf/sumIf
+    sql: |
+      CREATE VIEW answers.top_countries AS
+      SELECT country, countIf(status = 'completed') AS orders, sumIf(amount, status = 'completed') AS revenue
+      FROM sales.orders
+      WHERE created_at >= '2025-01-01 00:00:00' AND created_at < '2026-01-01 00:00:00'
+      GROUP BY country ORDER BY revenue DESC LIMIT 5;
+
+wrong_solutions:
+  - name: all statuses and both years
+    must_fail:
+      - orders and revenue are right for each country
+    sql: |
+      CREATE VIEW answers.top_countries AS
+      SELECT country, count() AS orders, sum(amount) AS revenue FROM sales.orders
+      GROUP BY country ORDER BY revenue DESC LIMIT 5;
+  - name: lowest first
+    must_fail:
+      - Correct five countries, highest revenue first
+    sql: |
+      CREATE VIEW answers.top_countries AS
+      SELECT country, count() AS orders, sum(amount) AS revenue FROM sales.orders
+      WHERE status = 'completed' AND toYear(created_at) = 2025
+      GROUP BY country ORDER BY revenue LIMIT 5;

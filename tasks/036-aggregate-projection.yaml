@@ -1,0 +1,96 @@
+id: 36
+slug: aggregate-projection
+title: An aggregating projection for a dashboard query
+domains: [optimizing]
+objectives: [O3, A3]
+tier: 3
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/data-modeling/projections
+  - https://clickhouse.com/docs/sql-reference/statements/alter/projection
+
+brief: |
+  dash.hits (ts, page, country, user_id, bytes) is sorted by ts. A dashboard
+  runs this query every few seconds and it scans the whole table:
+
+    SELECT page, count() AS hits, sum(bytes) AS traffic
+    FROM dash.hits
+    GROUP BY page
+
+  Without changing the table's ORDER BY, add a projection named page_totals
+  that pre-aggregates exactly what this query needs, and build it for the
+  existing data, so the dashboard query is answered from the projection.
+
+reset:
+  - DROP DATABASE IF EXISTS dash SYNC
+
+setup:
+  - CREATE DATABASE dash
+  - |
+    CREATE TABLE dash.hits (ts DateTime, page LowCardinality(String), country LowCardinality(String), user_id UInt64, bytes UInt32)
+    ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO dash.hits
+    SELECT toDateTime('2025-09-01 00:00:00') + (cityHash64(number, {seed}, 1) % (30 * 86400)),
+           concat('/page/', toString(cityHash64(number, {seed}, 2) % 300)),
+           ['NG', 'GH', 'KE', 'US', 'GB'][1 + (cityHash64(number, {seed}, 3) % 5)],
+           cityHash64(number, {seed}, 4) % 100000,
+           toUInt32(500 + cityHash64(number, {seed}, 5) % 200000)
+    FROM numbers(2000000)
+
+checks:
+  - name: ORDER BY is still ts, with a projection added
+    type: sql_true
+    points: 10
+    query: |
+      SELECT sorting_key = 'ts' AND (SELECT count() FROM system.projections WHERE database = 'dash' AND table = 'hits') > 0
+      FROM system.tables WHERE database = 'dash' AND name = 'hits'
+
+  - name: page_totals is an aggregating projection
+    type: sql_true
+    points: 25
+    query: |
+      SELECT type = 'Aggregate' FROM system.projections WHERE database = 'dash' AND table = 'hits' AND name = 'page_totals'
+    show: |
+      SELECT concat(name, ' ', type, ': ', query) FROM system.projections WHERE database = 'dash' AND table = 'hits'
+    hint: ALTER TABLE dash.hits ADD PROJECTION page_totals (SELECT page, count(), sum(bytes) GROUP BY page)
+
+  - name: Built for every existing part
+    type: sql_true
+    points: 25
+    query: |
+      SELECT (SELECT count() FROM system.parts WHERE database = 'dash' AND table = 'hits' AND active)
+           = (SELECT count() FROM system.projection_parts WHERE database = 'dash' AND table = 'hits' AND name = 'page_totals' AND active)
+    hint: ALTER TABLE dash.hits MATERIALIZE PROJECTION page_totals
+
+  - name: The dashboard query reads the projection
+    type: explain_contains
+    points: 40
+    query: SELECT page, count() AS hits, sum(bytes) AS traffic FROM dash.hits GROUP BY page
+    text: ReadFromMergeTree (page_totals)
+    hint: The projection must compute every aggregate the query asks for (count() and sum(bytes)) grouped by page.
+
+solution: |
+  ALTER TABLE dash.hits ADD PROJECTION page_totals
+  (
+      SELECT page, count(), sum(bytes)
+      GROUP BY page
+  );
+
+  ALTER TABLE dash.hits MATERIALIZE PROJECTION page_totals SETTINGS mutations_sync = 1;
+
+  EXPLAIN SELECT page, count() AS hits, sum(bytes) AS traffic FROM dash.hits GROUP BY page;
+
+wrong_solutions:
+  - name: projection missing sum(bytes)
+    must_fail:
+      - The dashboard query reads the projection
+    sql: |
+      ALTER TABLE dash.hits ADD PROJECTION page_totals (SELECT page, count() GROUP BY page);
+      ALTER TABLE dash.hits MATERIALIZE PROJECTION page_totals SETTINGS mutations_sync = 1;
+  - name: sorting projection instead of an aggregating one
+    must_fail:
+      - page_totals is an aggregating projection
+    sql: |
+      ALTER TABLE dash.hits ADD PROJECTION page_totals (SELECT * ORDER BY page);
+      ALTER TABLE dash.hits MATERIALIZE PROJECTION page_totals SETTINGS mutations_sync = 1;

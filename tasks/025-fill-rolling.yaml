@@ -1,0 +1,136 @@
+id: 25
+slug: fill-rolling
+title: Daily revenue with gaps filled and a 7-day average
+domains: [analyzing]
+objectives: [A4, A1, A3]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/select/order-by#order-by-expr-with-fill-modifier
+  - https://clickhouse.com/docs/sql-reference/window-functions
+
+brief: |
+  retail.sales has one row per sale: ts, store_id, amount. Store 7 is closed
+  on Sundays and on a few other days, so some dates have no rows at all.
+
+  Create a view answers.store7_march with exactly one row for every day from
+  2025-03-01 to 2025-03-31 (31 rows), ordered by day, with the columns:
+
+    day         the date (Date)
+    revenue     store 7's total sales that day (0 when there were none)
+    rolling_7d  the average of revenue over that day and the 6 days before it,
+                counting days with 0 revenue, and only using March days (so
+                1 March averages 1 day, 2 March averages 2 days, and so on)
+
+reset:
+  - DROP DATABASE IF EXISTS retail SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.store7_march SYNC
+
+setup:
+  - CREATE DATABASE retail
+  - |
+    CREATE TABLE retail.sales (ts DateTime, store_id UInt16, amount Decimal(10, 2))
+    ENGINE = MergeTree ORDER BY (store_id, ts)
+  - |
+    INSERT INTO retail.sales
+    SELECT ts, store, amount FROM
+    (
+        SELECT toDateTime('2025-02-15 08:00:00') + (cityHash64(number, {seed}, 1) % (50 * 86400)) AS ts,
+               toUInt16(1 + cityHash64(number, {seed}, 2) % 12) AS store,
+               toDecimal64(round(1 + (cityHash64(number, {seed}, 3) % 20000) / 100, 2), 2) AS amount
+        FROM numbers(120000)
+    )
+    WHERE NOT (store = 7 AND (toDayOfWeek(ts) = 7 OR toDate(ts) IN ('2025-03-12', '2025-03-13', '2025-03-21')))
+
+checks:
+  - name: answers.store7_march has columns day (Date), revenue, rolling_7d
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['day', 'revenue', 'rolling_7d'] AND groupArray(type)[1] = 'Date'
+      FROM (SELECT name, type FROM system.columns WHERE database = 'answers' AND table = 'store7_march' ORDER BY position)
+    show: SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'answers' AND table = 'store7_march' ORDER BY position
+
+  - name: 31 days, empty days included with revenue 0
+    type: result
+    points: 35
+    tolerance: 0.000001
+    query: SELECT day, toFloat64(revenue) AS r FROM answers.store7_march
+    expect: |
+      SELECT d.day AS day, toFloat64(ifNull(s.r, 0)) AS r
+      FROM (SELECT toDate('2025-03-01') + number AS day FROM numbers(31)) AS d
+      LEFT JOIN (SELECT toDate(ts) AS day, sum(amount) AS r FROM retail.sales WHERE store_id = 7 GROUP BY day) AS s
+      ON d.day = s.day
+      ORDER BY day
+      SETTINGS join_use_nulls = 1
+    hint: >-
+      ORDER BY day WITH FILL FROM toDate('2025-03-01') TO toDate('2025-04-01') adds the missing days,
+      or build a calendar (numbers(31)) and LEFT JOIN the sales to it.
+
+  - name: rolling_7d averages the filled days
+    type: result
+    points: 55
+    tolerance: 0.000001
+    query: SELECT day, toFloat64(rolling_7d) AS avg7 FROM answers.store7_march
+    expect: |
+      SELECT day, avg(r) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS avg7
+      FROM
+      (
+          SELECT d.day AS day, toFloat64(ifNull(s.r, 0)) AS r
+          FROM (SELECT toDate('2025-03-01') + number AS day FROM numbers(31)) AS d
+          LEFT JOIN (SELECT toDate(ts) AS day, sum(amount) AS r FROM retail.sales WHERE store_id = 7 GROUP BY day) AS s
+          ON d.day = s.day
+          SETTINGS join_use_nulls = 1
+      )
+      ORDER BY day
+    hint: >-
+      Window functions run before WITH FILL, so filled rows are invisible to a window in the same
+      SELECT. Fill first in a subquery, then compute the window over it.
+
+solution: |
+  CREATE VIEW answers.store7_march AS
+  SELECT
+      day,
+      revenue,
+      avg(revenue) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_7d
+  FROM
+  (
+      SELECT toDate(ts) AS day, sum(amount) AS revenue
+      FROM retail.sales
+      WHERE store_id = 7 AND ts >= '2025-03-01 00:00:00' AND ts < '2025-04-01 00:00:00'
+      GROUP BY day
+      ORDER BY day WITH FILL FROM toDate('2025-03-01') TO toDate('2025-04-01')
+  )
+  ORDER BY day;
+
+alternatives:
+  - name: calendar from numbers() with LEFT JOIN
+    sql: |
+      CREATE VIEW answers.store7_march AS
+      SELECT day, revenue, avg(revenue) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_7d
+      FROM (
+        SELECT c.day AS day, toFloat64(ifNull(s.revenue, 0)) AS revenue
+        FROM (SELECT toDate('2025-03-01') + number AS day FROM numbers(31)) AS c
+        LEFT JOIN (SELECT toDate(ts) AS day, sum(amount) AS revenue FROM retail.sales WHERE store_id = 7 GROUP BY day) AS s
+        ON c.day = s.day SETTINGS join_use_nulls = 1)
+      ORDER BY day;
+
+wrong_solutions:
+  - name: window and WITH FILL in the same SELECT
+    must_fail:
+      - rolling_7d averages the filled days
+    sql: |
+      CREATE VIEW answers.store7_march AS
+      SELECT toDate(ts) AS day, sum(amount) AS revenue,
+             avg(sum(amount)) OVER (ORDER BY toDate(ts) ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_7d
+      FROM retail.sales WHERE store_id = 7 AND toYYYYMM(ts) = 202503
+      GROUP BY day ORDER BY day WITH FILL FROM toDate('2025-03-01') TO toDate('2025-04-01');
+  - name: gaps not filled
+    must_fail:
+      - 31 days, empty days included with revenue 0
+    sql: |
+      CREATE VIEW answers.store7_march AS
+      SELECT day, revenue, avg(revenue) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_7d
+      FROM (SELECT toDate(ts) AS day, sum(amount) AS revenue FROM retail.sales
+            WHERE store_id = 7 AND toYYYYMM(ts) = 202503 GROUP BY day) ORDER BY day;

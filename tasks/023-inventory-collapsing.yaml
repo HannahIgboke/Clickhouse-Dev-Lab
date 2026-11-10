@@ -1,0 +1,162 @@
+id: 23
+slug: inventory-collapsing
+title: Apply a batch of updates with CollapsingMergeTree
+domains: [dedup, inserting]
+objectives: [D3, I5, M2, A3]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/collapsingmergetree
+  - https://clickhouse.com/docs/sql-reference/statements/insert-into
+
+brief: |
+  inventory.snapshot holds the current stock: one row per (sku, warehouse)
+  with qty. inventory.changes holds a batch of stock counts that replace
+  the qty of some existing (sku, warehouse) pairs (column new_qty).
+
+  1. Create inventory.stock with the CollapsingMergeTree engine (sign column
+  sign), sorted by sku then warehouse, with the columns
+  sku String, warehouse LowCardinality(String), qty UInt32, sign Int8.
+
+  2. Load every snapshot row as a state row.
+
+  3. Apply every change in inventory.changes the CollapsingMergeTree way,
+  using INSERT ... SELECT: for each changed pair, cancel the old state and
+  write the new one. Do not use ALTER TABLE.
+
+  4. Create a view answers.stock_by_warehouse with columns warehouse and
+  total_qty (current total stock per warehouse), ordered by warehouse,
+  correct even before merges.
+
+reset:
+  - DROP DATABASE IF EXISTS inventory SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.stock_by_warehouse SYNC
+
+setup:
+  - CREATE DATABASE inventory
+  - |
+    CREATE TABLE inventory.snapshot (sku String, warehouse LowCardinality(String), qty UInt32)
+    ENGINE = MergeTree ORDER BY (sku, warehouse)
+  - |
+    INSERT INTO inventory.snapshot
+    SELECT concat('SKU-', leftPad(toString(intDiv(number, 4)), 5, '0')), ['LOS', 'ABV', 'PHC', 'KAN'][1 + number % 4],
+           toUInt32(cityHash64(number, {seed}, 1) % 500)
+    FROM numbers(40000)
+  - |
+    CREATE TABLE inventory.changes (sku String, warehouse LowCardinality(String), new_qty UInt32)
+    ENGINE = MergeTree ORDER BY (sku, warehouse)
+  - |
+    INSERT INTO inventory.changes
+    SELECT sku, warehouse, toUInt32(cityHash64(sku, warehouse, {seed}, 2) % 700)
+    FROM inventory.snapshot WHERE cityHash64(sku, warehouse, {seed}, 3) % 10 = 0
+
+checks:
+  - name: inventory.stock is CollapsingMergeTree(sign) sorted by (sku, warehouse)
+    type: sql_true
+    points: 15
+    query: |
+      SELECT match(engine_full, '^CollapsingMergeTree\\(sign\\)') AND sorting_key = 'sku, warehouse'
+             AND (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+                   WHERE database = 'inventory' AND table = 'stock' ORDER BY position))
+                 = ['sku String', 'warehouse LowCardinality(String)', 'qty UInt32', 'sign Int8']
+      FROM system.tables WHERE database = 'inventory' AND name = 'stock'
+    show: SELECT engine_full FROM system.tables WHERE database = 'inventory' AND name = 'stock'
+
+  - name: Exactly one live state per (sku, warehouse)
+    type: sql_true
+    points: 20
+    query: |
+      SELECT count() = (SELECT count() FROM inventory.snapshot) AND countIf(s != 1) = 0
+      FROM (SELECT sku, warehouse, sum(sign) AS s FROM inventory.stock GROUP BY sku, warehouse)
+    show: |
+      SELECT concat(toString(countIf(s = 1)), ' pairs live, ', toString(countIf(s != 1)), ' pairs with sum(sign) != 1')
+      FROM (SELECT sku, warehouse, sum(sign) AS s FROM inventory.stock GROUP BY sku, warehouse)
+    hint: Each change needs exactly one cancel row (-1) and one new state row (+1).
+
+  - name: Current quantities reflect the changes
+    type: result
+    points: 35
+    query: |
+      SELECT count() AS pairs, sum(q) AS total, groupBitXor(cityHash64(sku, toString(warehouse), q)) AS fp
+      FROM (SELECT sku, warehouse, sum(toInt64(qty) * sign) AS q FROM inventory.stock GROUP BY sku, warehouse HAVING sum(sign) > 0)
+    expect: |
+      SELECT count() AS pairs, sum(q) AS total, groupBitXor(cityHash64(sku, toString(warehouse), q)) AS fp
+      FROM (SELECT s.sku AS sku, s.warehouse AS warehouse, toInt64(if(c.sku != '', c.new_qty, s.qty)) AS q
+            FROM inventory.snapshot AS s LEFT JOIN inventory.changes AS c ON s.sku = c.sku AND s.warehouse = c.warehouse)
+    hint: A cancel row must repeat the old qty exactly, or sum(qty * sign) will be off.
+
+  - name: answers.stock_by_warehouse is right before merges
+    type: result
+    points: 30
+    query: SELECT toString(warehouse) AS w, toInt64(total_qty) AS t FROM answers.stock_by_warehouse
+    expect: |
+      SELECT toString(s.warehouse) AS w, sum(toInt64(if(c.sku != '', c.new_qty, s.qty))) AS t
+      FROM inventory.snapshot AS s LEFT JOIN inventory.changes AS c ON s.sku = c.sku AND s.warehouse = c.warehouse
+      GROUP BY w ORDER BY w
+
+solution: |
+  CREATE TABLE inventory.stock
+  (
+      sku       String,
+      warehouse LowCardinality(String),
+      qty       UInt32,
+      sign      Int8
+  )
+  ENGINE = CollapsingMergeTree(sign)
+  ORDER BY (sku, warehouse);
+
+  INSERT INTO inventory.stock SELECT sku, warehouse, qty, 1 FROM inventory.snapshot;
+
+  -- Cancel the old states (exact copies, sign -1)...
+  INSERT INTO inventory.stock
+  SELECT s.sku, s.warehouse, s.qty, -1
+  FROM inventory.snapshot AS s
+  INNER JOIN inventory.changes AS c ON s.sku = c.sku AND s.warehouse = c.warehouse;
+
+  -- ...and write the new ones.
+  INSERT INTO inventory.stock SELECT sku, warehouse, new_qty, 1 FROM inventory.changes;
+
+  CREATE VIEW answers.stock_by_warehouse AS
+  SELECT warehouse, sum(qty * sign) AS total_qty
+  FROM inventory.stock
+  GROUP BY warehouse
+  ORDER BY warehouse;
+
+alternatives:
+  - name: one INSERT with arrayJoin, FINAL in the view
+    sql: |
+      CREATE TABLE inventory.stock (sku String, warehouse LowCardinality(String), qty UInt32, sign Int8)
+      ENGINE = CollapsingMergeTree(sign) ORDER BY (sku, warehouse);
+      INSERT INTO inventory.stock SELECT sku, warehouse, qty, 1 FROM inventory.snapshot;
+      INSERT INTO inventory.stock
+      SELECT sku, warehouse, r.1 AS qty, r.2 AS sign
+      FROM (SELECT s.sku AS sku, s.warehouse AS warehouse, arrayJoin([(s.qty, toInt8(-1)), (c.new_qty, toInt8(1))]) AS r
+            FROM inventory.snapshot AS s INNER JOIN inventory.changes AS c USING (sku, warehouse));
+      CREATE VIEW answers.stock_by_warehouse AS
+      SELECT warehouse, sum(qty) AS total_qty FROM inventory.stock FINAL GROUP BY warehouse ORDER BY warehouse;
+
+wrong_solutions:
+  - name: new states only, no cancels
+    must_fail:
+      - Exactly one live state per (sku, warehouse)
+      - Current quantities reflect the changes
+      - answers.stock_by_warehouse is right before merges
+    sql: |
+      CREATE TABLE inventory.stock (sku String, warehouse LowCardinality(String), qty UInt32, sign Int8)
+      ENGINE = CollapsingMergeTree(sign) ORDER BY (sku, warehouse);
+      INSERT INTO inventory.stock SELECT sku, warehouse, qty, 1 FROM inventory.snapshot;
+      INSERT INTO inventory.stock SELECT sku, warehouse, new_qty, 1 FROM inventory.changes;
+      CREATE VIEW answers.stock_by_warehouse AS
+      SELECT warehouse, sum(qty * sign) AS total_qty FROM inventory.stock GROUP BY warehouse ORDER BY warehouse;
+  - name: cancel rows carry the new qty
+    must_fail:
+      - Current quantities reflect the changes
+    sql: |
+      CREATE TABLE inventory.stock (sku String, warehouse LowCardinality(String), qty UInt32, sign Int8)
+      ENGINE = CollapsingMergeTree(sign) ORDER BY (sku, warehouse);
+      INSERT INTO inventory.stock SELECT sku, warehouse, qty, 1 FROM inventory.snapshot;
+      INSERT INTO inventory.stock SELECT sku, warehouse, new_qty, -1 FROM inventory.changes;
+      INSERT INTO inventory.stock SELECT sku, warehouse, new_qty, 1 FROM inventory.changes;
+      CREATE VIEW answers.stock_by_warehouse AS
+      SELECT warehouse, sum(qty * sign) AS total_qty FROM inventory.stock GROUP BY warehouse ORDER BY warehouse;

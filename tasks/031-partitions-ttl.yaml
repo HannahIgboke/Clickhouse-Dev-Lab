@@ -1,0 +1,113 @@
+id: 31
+slug: partitions-ttl
+title: "Stretch: monthly partitions, a TTL and a dropped partition"
+domains: [stretch]
+objectives: [S1, M2, I5]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/custom-partitioning-key
+  - https://clickhouse.com/docs/guides/developer/ttl
+  - https://clickhouse.com/docs/sql-reference/statements/alter/partition#drop-partitionpart
+
+brief: |
+  archive.raw_logs holds application logs (ts, level, service, message) from
+  July 2024 to December 2025.
+
+  1. Create archive.logs with the same columns, partitioned by month
+  (toYYYYMM(ts)), sorted by service then ts, with a TTL that deletes rows
+  2 years after their ts.
+
+  2. Copy all rows from archive.raw_logs into it.
+
+  3. The logs for March 2025 were corrupted: remove that whole month by
+  dropping its partition.
+
+  4. Make sure rows that are already past their TTL are actually gone now,
+  without waiting for a background merge.
+
+reset:
+  - DROP DATABASE IF EXISTS archive SYNC
+
+setup:
+  - CREATE DATABASE archive
+  - |
+    CREATE TABLE archive.raw_logs (ts DateTime, level LowCardinality(String), service LowCardinality(String), message String)
+    ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO archive.raw_logs
+    SELECT toDateTime('2024-07-01 00:00:00') + (cityHash64(number, {seed}, 1) % (549 * 86400)),
+           ['INFO', 'INFO', 'INFO', 'WARN', 'ERROR', 'DEBUG'][1 + (cityHash64(number, {seed}, 2) % 6)],
+           ['api', 'worker', 'scheduler', 'auth'][1 + (cityHash64(number, {seed}, 3) % 4)],
+           concat('event ', toString(number))
+    FROM numbers(400000)
+
+checks:
+  - name: Partitioned by toYYYYMM(ts), sorted by (service, ts)
+    type: sql_true
+    points: 20
+    query: |
+      SELECT partition_key = 'toYYYYMM(ts)' AND sorting_key = 'service, ts'
+      FROM system.tables WHERE database = 'archive' AND name = 'logs'
+    show: SELECT concat(partition_key, ' / ', sorting_key) FROM system.tables WHERE database = 'archive' AND name = 'logs'
+
+  - name: TTL deletes rows 2 years after ts
+    type: sql_true
+    points: 20
+    query: |
+      SELECT match(replaceAll(create_table_query, ' ', ''), 'TTLts\\+toIntervalYear\\(2\\)|TTLts\\+INTERVAL2YEAR|TTLts\\+toIntervalMonth\\(24\\)')
+      FROM system.tables WHERE database = 'archive' AND name = 'logs'
+    show: SELECT extract(create_table_query, 'TTL .*') FROM system.tables WHERE database = 'archive' AND name = 'logs'
+    hint: TTL ts + INTERVAL 2 YEAR (DELETE is the default action).
+
+  - name: March 2025 partition dropped
+    type: sql_true
+    points: 25
+    query: |
+      SELECT (SELECT count() FROM system.parts WHERE database = 'archive' AND table = 'logs' AND active AND partition = '202503') = 0
+         AND (SELECT count() FROM archive.logs WHERE toYYYYMM(ts) = 202503) = 0
+    hint: ALTER TABLE archive.logs DROP PARTITION 202503
+
+  - name: Exactly the unexpired rows outside March 2025 remain
+    type: result
+    points: 35
+    query: SELECT count() AS n, groupBitXor(cityHash64(ts, message)) AS fp FROM archive.logs
+    expect: |
+      SELECT count() AS n, groupBitXor(cityHash64(ts, message)) AS fp FROM archive.raw_logs
+      WHERE toYYYYMM(ts) != 202503 AND ts + INTERVAL 2 YEAR > now()
+    hint: ALTER TABLE archive.logs MATERIALIZE TTL (or OPTIMIZE TABLE ... FINAL) applies the TTL to existing parts.
+
+solution: |
+  CREATE TABLE archive.logs
+  (
+      ts      DateTime,
+      level   LowCardinality(String),
+      service LowCardinality(String),
+      message String
+  )
+  ENGINE = MergeTree
+  PARTITION BY toYYYYMM(ts)
+  ORDER BY (service, ts)
+  TTL ts + INTERVAL 2 YEAR;
+
+  INSERT INTO archive.logs SELECT * FROM archive.raw_logs;
+
+  ALTER TABLE archive.logs DROP PARTITION 202503;
+
+  ALTER TABLE archive.logs MATERIALIZE TTL SETTINGS mutations_sync = 1;
+
+  SELECT partition, sum(rows) FROM system.parts
+  WHERE database = 'archive' AND table = 'logs' AND active GROUP BY partition ORDER BY partition;
+
+wrong_solutions:
+  - name: TTL never applied, March deleted row by row
+    must_fail:
+      - March 2025 partition dropped
+      - Exactly the unexpired rows outside March 2025 remain
+    sql: |
+      CREATE TABLE archive.logs (ts DateTime, level LowCardinality(String), service LowCardinality(String), message String)
+      ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (service, ts) TTL ts + INTERVAL 2 YEAR
+      SETTINGS merge_with_ttl_timeout = 86400, materialize_ttl_recalculate_only = 1;
+      SYSTEM STOP TTL MERGES archive.logs;
+      INSERT INTO archive.logs SELECT * FROM archive.raw_logs SETTINGS optimize_on_insert = 0;
+      ALTER TABLE archive.logs DELETE WHERE toYYYYMM(ts) = 202503 AND level = 'INFO' SETTINGS mutations_sync = 1;

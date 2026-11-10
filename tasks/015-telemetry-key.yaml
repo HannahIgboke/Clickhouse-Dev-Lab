@@ -1,0 +1,133 @@
+id: 15
+slug: telemetry-key
+title: One primary key for two query patterns
+domains: [modeling, inserting]
+objectives: [M4, I5, M2]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/best-practices/choosing-a-primary-key
+  - https://clickhouse.com/docs/guides/best-practices/sparse-primary-indexes
+  - https://clickhouse.com/docs/sql-reference/statements/explain#explain-indexes
+
+brief: |
+  telemetry.events_raw holds 60 days of product events (tenant_id, event_type,
+  ts, user_id, value) in a table with no useful sort order.
+
+  The dashboard runs only these two query shapes:
+
+    Q1  WHERE tenant_id = ? AND ts >= ? AND ts < ?                  (one day)
+    Q2  WHERE tenant_id = ? AND event_type = ? AND ts >= ? AND ts < ? (one day)
+
+  1. Create telemetry.events: MergeTree, the same columns and types as
+  telemetry.events_raw, with a primary key that lets BOTH query shapes skip
+  almost all granules.
+
+  2. Copy every row from telemetry.events_raw into it.
+
+  Check your design with EXPLAIN indexes = 1 on both shapes.
+
+reset:
+  - DROP DATABASE IF EXISTS telemetry SYNC
+
+setup:
+  - CREATE DATABASE telemetry
+  - |
+    CREATE TABLE telemetry.events_raw
+    (
+        tenant_id  UInt16,
+        event_type LowCardinality(String),
+        ts         DateTime,
+        user_id    UInt64,
+        value      Float32
+    )
+    ENGINE = MergeTree ORDER BY tuple()
+  - |
+    INSERT INTO telemetry.events_raw
+    SELECT toUInt16(1 + cityHash64(number, {seed}, 1) % 50),
+           concat('evt_', toString(cityHash64(number, {seed}, 2) % 20)),
+           toDateTime('2025-04-01 00:00:00') + (cityHash64(number, {seed}, 3) % (60 * 86400)),
+           cityHash64(number, {seed}, 4) % 100000,
+           (cityHash64(number, {seed}, 5) % 10000) / 100
+    FROM numbers(4000000)
+
+checks:
+  - name: telemetry.events matches events_raw's columns, MergeTree
+    type: sql_true
+    points: 10
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'telemetry' AND table = 'events' ORDER BY position))
+           = (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'telemetry' AND table = 'events_raw' ORDER BY position))
+         AND (SELECT engine FROM system.tables WHERE database = 'telemetry' AND name = 'events') = 'MergeTree'
+    hint: CREATE TABLE telemetry.events AS telemetry.events_raw ENGINE = MergeTree ORDER BY (...) copies the columns.
+
+  - name: Every row copied
+    type: result
+    points: 20
+    query: SELECT count() AS rows, sum(user_id) AS u, groupBitXor(cityHash64(tenant_id, event_type, ts, user_id)) AS fp FROM telemetry.events
+    expect: SELECT count() AS rows, sum(user_id) AS u, groupBitXor(cityHash64(tenant_id, event_type, ts, user_id)) AS fp FROM telemetry.events_raw
+
+  - name: Q1 (tenant + one day) reads at most 1.5% of granules
+    type: granules
+    points: 35
+    max_ratio: 0.015
+    query: |
+      SELECT count() FROM telemetry.events
+      WHERE tenant_id = 7 AND ts >= '2025-05-10 00:00:00' AND ts < '2025-05-11 00:00:00'
+    hint: >-
+      A key that puts event_type before the time column cannot use the time range when Q1
+      gives no event_type. Lead with tenant_id, then time. If ts appears twice in your key
+      (toDate(ts) ... ts), ClickHouse may match the range to the later column: compare with EXPLAIN.
+
+  - name: Q2 (tenant + type + one day) reads at most 1.5% of granules
+    type: granules
+    points: 35
+    max_ratio: 0.015
+    query: |
+      SELECT count() FROM telemetry.events
+      WHERE tenant_id = 7 AND event_type = 'evt_3' AND ts >= '2025-05-10 00:00:00' AND ts < '2025-05-11 00:00:00'
+
+solution: |
+  -- Both shapes filter on tenant_id and a time range; only Q2 adds event_type.
+  CREATE TABLE telemetry.events AS telemetry.events_raw
+  ENGINE = MergeTree
+  ORDER BY (tenant_id, toDate(ts), event_type);
+  -- Note: appending ts again, ORDER BY (tenant_id, toDate(ts), event_type, ts), reads about
+  -- 3x more granules for Q1 in ClickHouse 25.8: the ts range is matched to the last key
+  -- column instead of toDate(ts). EXPLAIN indexes = 1 shows it.
+
+  INSERT INTO telemetry.events SELECT * FROM telemetry.events_raw;
+
+  EXPLAIN indexes = 1
+  SELECT count() FROM telemetry.events
+  WHERE tenant_id = 7 AND ts >= '2025-05-10 00:00:00' AND ts < '2025-05-11 00:00:00';
+
+alternatives:
+  - name: (tenant_id, ts)
+    sql: |
+      CREATE TABLE telemetry.events (tenant_id UInt16, event_type LowCardinality(String), ts DateTime, user_id UInt64, value Float32)
+      ENGINE = MergeTree ORDER BY (tenant_id, ts);
+      INSERT INTO telemetry.events SELECT * FROM telemetry.events_raw;
+
+wrong_solutions:
+  - name: time column repeated at the end of the key
+    must_fail:
+      - Q1 (tenant + one day) reads at most 1.5% of granules
+    sql: |
+      CREATE TABLE telemetry.events AS telemetry.events_raw ENGINE = MergeTree ORDER BY (tenant_id, toDate(ts), event_type, ts);
+      INSERT INTO telemetry.events SELECT * FROM telemetry.events_raw;
+  - name: event_type before time
+    must_fail:
+      - Q1 (tenant + one day) reads at most 1.5% of granules
+    sql: |
+      CREATE TABLE telemetry.events AS telemetry.events_raw ENGINE = MergeTree ORDER BY (tenant_id, event_type, ts);
+      INSERT INTO telemetry.events SELECT * FROM telemetry.events_raw;
+  - name: time first
+    must_fail:
+      - Q1 (tenant + one day) reads at most 1.5% of granules
+      - Q2 (tenant + type + one day) reads at most 1.5% of granules
+    sql: |
+      CREATE TABLE telemetry.events AS telemetry.events_raw ENGINE = MergeTree ORDER BY (ts, tenant_id);
+      INSERT INTO telemetry.events SELECT * FROM telemetry.events_raw;

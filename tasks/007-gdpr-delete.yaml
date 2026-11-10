@@ -1,0 +1,98 @@
+id: 7
+slug: gdpr-delete
+title: Erase users with a lightweight delete
+domains: [dedup]
+objectives: [D1]
+tier: 1
+minutes: 6
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/delete
+  - https://clickhouse.com/docs/guides/developer/lightweight-delete
+
+brief: |
+  The table events.clicks holds click events for about 5,000 users. The
+  table events.erasure_requests lists the user_id of every user who asked to
+  be forgotten.
+
+  Remove every click belonging to those users from events.clicks using a
+  lightweight delete (not an ALTER TABLE ... DELETE mutation). All other
+  clicks must stay untouched.
+
+reset:
+  - DROP DATABASE IF EXISTS events SYNC
+  - DROP DATABASE IF EXISTS chlab_truth_t7 SYNC
+
+setup:
+  - CREATE DATABASE events
+  - CREATE DATABASE chlab_truth_t7
+  - |
+    CREATE TABLE events.clicks
+    (
+        user_id UInt32,
+        ts      DateTime,
+        page    LowCardinality(String)
+    )
+    ENGINE = MergeTree
+    ORDER BY (user_id, ts)
+  - |
+    INSERT INTO events.clicks
+    SELECT toUInt32(1 + cityHash64(number, {seed}, 1) % 5000),
+           toDateTime('2025-06-01 00:00:00') + (cityHash64(number, {seed}, 2) % (30 * 86400)),
+           ['/home', '/pricing', '/docs', '/blog', '/signup'][1 + (cityHash64(number, {seed}, 3) % 5)]
+    FROM numbers(300000)
+  - CREATE TABLE events.erasure_requests (user_id UInt32) ENGINE = MergeTree ORDER BY user_id
+  - |
+    INSERT INTO events.erasure_requests
+    SELECT DISTINCT toUInt32(1 + cityHash64(number, {seed}, 9) % 5000) FROM numbers(25)
+  - |
+    CREATE TABLE chlab_truth_t7.kept ENGINE = MergeTree ORDER BY tuple() AS
+    SELECT count() AS rows, groupBitXor(cityHash64(user_id, ts, page)) AS fp
+    FROM events.clicks WHERE user_id NOT IN (SELECT user_id FROM events.erasure_requests)
+
+checks:
+  - name: No clicks left for erased users
+    type: sql_true
+    points: 35
+    query: |
+      SELECT count() = 0 FROM events.clicks
+      WHERE user_id IN (SELECT user_id FROM events.erasure_requests)
+    show: |
+      SELECT concat(toString(count()), ' rows remain') FROM events.clicks
+      WHERE user_id IN (SELECT user_id FROM events.erasure_requests)
+
+  - name: Every other click untouched
+    type: result
+    points: 35
+    query: SELECT count() AS rows, groupBitXor(cityHash64(user_id, ts, page)) AS fp FROM events.clicks
+    expect: SELECT rows, fp FROM chlab_truth_t7.kept
+
+  - name: Done with a lightweight DELETE, not ALTER TABLE ... DELETE
+    type: sql_true
+    points: 30
+    query: |
+      SELECT countIf(command LIKE '%_row_exists = 0%') > 0 AND countIf(command LIKE '%DELETE WHERE%') = 0
+      FROM system.mutations WHERE database = 'events' AND table = 'clicks'
+    show: SELECT command FROM system.mutations WHERE database = 'events' AND table = 'clicks'
+    hint: >-
+      DELETE FROM table WHERE ... marks rows as deleted (a hidden _row_exists column)
+      and is much cheaper than ALTER TABLE ... DELETE, which rewrites whole parts.
+
+solution: |
+  SELECT count() FROM events.clicks WHERE user_id IN (SELECT user_id FROM events.erasure_requests);
+
+  DELETE FROM events.clicks
+  WHERE user_id IN (SELECT user_id FROM events.erasure_requests);
+
+wrong_solutions:
+  - name: heavy ALTER TABLE ... DELETE
+    must_fail:
+      - Done with a lightweight DELETE, not ALTER TABLE ... DELETE
+    sql: |
+      ALTER TABLE events.clicks DELETE WHERE user_id IN (SELECT user_id FROM events.erasure_requests)
+      SETTINGS mutations_sync = 1;
+  - name: only some users
+    must_fail:
+      - No clicks left for erased users
+      - Every other click untouched
+    sql: |
+      DELETE FROM events.clicks WHERE user_id IN (SELECT user_id FROM events.erasure_requests LIMIT 5);

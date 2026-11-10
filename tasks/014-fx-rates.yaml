@@ -1,0 +1,149 @@
+id: 14
+slug: fx-rates
+title: Convert currencies with a range dictionary
+domains: [modeling, analyzing]
+objectives: [M5, A3, A4]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/sql-reference/dictionaries#range_hashed
+  - https://clickhouse.com/docs/sql-reference/statements/create/dictionary
+  - https://clickhouse.com/docs/sql-reference/functions/ext-dict-functions#dictget
+
+brief: |
+  fx.rates holds exchange rates to US dollars. Each row is valid for a
+  period: currency (a String code such as 'NGN'), valid_from and valid_to
+  (Dates, both inclusive) and usd_rate (1 unit of the currency = usd_rate USD).
+  Periods for a currency never overlap.
+
+  fx.payments holds payments: payment_id, currency, amount (in that currency)
+  and paid_on (a Date).
+
+  1. Create a dictionary fx.rate_dict over fx.rates that returns usd_rate for
+  a currency on a given date, using the validity range.
+
+  2. Create a view answers.usd_by_month with columns month (the first day of
+  the month, a Date) and usd_total (the sum of every payment's amount
+  converted to USD at the rate valid on its paid_on date), ordered by month.
+
+reset:
+  - DROP DATABASE IF EXISTS fx SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.usd_by_month SYNC
+
+setup:
+  - CREATE DATABASE fx
+  - |
+    CREATE TABLE fx.rates (currency String, valid_from Date, valid_to Date, usd_rate Float64)
+    ENGINE = MergeTree ORDER BY (currency, valid_from)
+  - |
+    INSERT INTO fx.rates
+    SELECT c, toDate('2025-01-01') + w * 7, toDate('2025-01-01') + w * 7 + 6,
+           round(base * (1 + ((cityHash64(c, w, {seed}) % 200) - 100) / 2000), 8)
+    FROM
+    (
+        SELECT arrayJoin([('NGN', 0.00065), ('GHS', 0.065), ('KES', 0.0077), ('EUR', 1.08), ('GBP', 1.27), ('JPY', 0.0066)]) AS p,
+               p.1 AS c, p.2 AS base, arrayJoin(range(53)) AS w
+    )
+  - |
+    CREATE TABLE fx.payments (payment_id UInt64, currency LowCardinality(String), amount Decimal(14, 2), paid_on Date)
+    ENGINE = MergeTree ORDER BY (paid_on, payment_id)
+  - |
+    INSERT INTO fx.payments
+    SELECT number + 1,
+           ['NGN', 'NGN', 'GHS', 'KES', 'EUR', 'GBP', 'JPY'][1 + (cityHash64(number, {seed}, 1) % 7)] AS c,
+           toDecimal64(round(multiIf(c = 'NGN', 500000, c = 'JPY', 80000, c = 'KES', 60000, 3000) * (cityHash64(number, {seed}, 2) % 1000) / 1000, 2), 2),
+           toDate('2025-01-01') + (cityHash64(number, {seed}, 3) % 365)
+    FROM numbers(120000)
+
+checks:
+  - name: fx.rate_dict is a range dictionary over fx.rates
+    type: sql_true
+    points: 20
+    prepare:
+      - SELECT dictGet('fx.rate_dict', 'usd_rate', 'EUR', toDate('2025-03-01'))
+    query: |
+      SELECT type LIKE '%Range%' AND source LIKE '%rates%' AND status = 'LOADED'
+      FROM system.dictionaries WHERE database = 'fx' AND name = 'rate_dict'
+    show: SELECT concat(type, ' / ', status, ' / ', last_exception) FROM system.dictionaries WHERE database = 'fx' AND name = 'rate_dict'
+    hint: >-
+      LAYOUT(COMPLEX_KEY_RANGE_HASHED()) for a String key, with RANGE(MIN valid_from MAX valid_to).
+
+  - name: The dictionary returns the rate valid on a date
+    type: sql_true
+    points: 25
+    query: |
+      SELECT count() > 0 AND countIf(abs(dictGet('fx.rate_dict', 'usd_rate', currency, toDate(valid_from + 3)) - usd_rate) > 1e-12) = 0
+      FROM fx.rates
+    show: |
+      SELECT concat(currency, ' ', toString(valid_from + 3), ': got ', toString(dictGet('fx.rate_dict', 'usd_rate', currency, toDate(valid_from + 3))), ', want ', toString(usd_rate))
+      FROM fx.rates WHERE abs(dictGet('fx.rate_dict', 'usd_rate', currency, toDate(valid_from + 3)) - usd_rate) > 1e-12 LIMIT 3
+
+  - name: answers.usd_by_month has columns month (Date) and usd_total
+    type: sql_true
+    points: 15
+    query: |
+      SELECT groupArray(concat(name, ':', type)) IN (['month:Date', 'usd_total:Float64'], ['month:Date', 'usd_total:Nullable(Float64)'])
+             OR (groupArray(name) = ['month', 'usd_total'] AND groupArray(type)[1] = 'Date')
+      FROM (SELECT name, type FROM system.columns WHERE database = 'answers' AND table = 'usd_by_month' ORDER BY position)
+    show: SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'answers' AND table = 'usd_by_month' ORDER BY position
+
+  - name: Monthly USD totals are right, in month order
+    type: result
+    points: 40
+    tolerance: 0.0001
+    query: SELECT month, toFloat64(usd_total) AS usd FROM answers.usd_by_month
+    expect: |
+      SELECT toStartOfMonth(p.paid_on) AS month, sum(toFloat64(p.amount) * r.usd_rate) AS usd
+      FROM fx.payments AS p
+      INNER JOIN fx.rates AS r ON p.currency = r.currency
+      WHERE p.paid_on BETWEEN r.valid_from AND r.valid_to
+      GROUP BY month ORDER BY month
+    hint: dictGet('fx.rate_dict', 'usd_rate', currency, paid_on) picks the rate for that day.
+
+solution: |
+  CREATE DICTIONARY fx.rate_dict
+  (
+      currency   String,
+      valid_from Date,
+      valid_to   Date,
+      usd_rate   Float64
+  )
+  PRIMARY KEY currency
+  SOURCE(CLICKHOUSE(DB 'fx' TABLE 'rates'))
+  LAYOUT(COMPLEX_KEY_RANGE_HASHED())
+  RANGE(MIN valid_from MAX valid_to)
+  LIFETIME(MIN 0 MAX 3600);
+
+  SELECT dictGet('fx.rate_dict', 'usd_rate', 'NGN', toDate('2025-06-15'));
+
+  CREATE VIEW answers.usd_by_month AS
+  SELECT toStartOfMonth(paid_on) AS month,
+         sum(toFloat64(amount) * dictGet('fx.rate_dict', 'usd_rate', toString(currency), paid_on)) AS usd_total
+  FROM fx.payments
+  GROUP BY month
+  ORDER BY month;
+
+alternatives:
+  - name: rounded totals and Decimal arithmetic
+    sql: |
+      CREATE DICTIONARY fx.rate_dict (currency String, valid_from Date, valid_to Date, usd_rate Float64)
+      PRIMARY KEY currency SOURCE(CLICKHOUSE(TABLE 'rates' DB 'fx'))
+      LAYOUT(COMPLEX_KEY_RANGE_HASHED(range_lookup_strategy 'max')) RANGE(MIN valid_from MAX valid_to) LIFETIME(0);
+      CREATE VIEW answers.usd_by_month AS
+      SELECT toStartOfMonth(paid_on) AS month,
+             round(sum(amount * toDecimal64(dictGet('fx.rate_dict', 'usd_rate', currency, paid_on), 8)), 2) AS usd_total
+      FROM fx.payments GROUP BY month ORDER BY month ASC;
+
+wrong_solutions:
+  - name: hashed dictionary ignoring the date range
+    must_fail:
+      - fx.rate_dict is a range dictionary over fx.rates
+      - The dictionary returns the rate valid on a date
+      - Monthly USD totals are right, in month order
+    sql: |
+      CREATE DICTIONARY fx.rate_dict (currency String, usd_rate Float64)
+      PRIMARY KEY currency SOURCE(CLICKHOUSE(DB 'fx' TABLE 'rates')) LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(0);
+      CREATE VIEW answers.usd_by_month AS
+      SELECT toStartOfMonth(paid_on) AS month, sum(toFloat64(amount) * dictGet('fx.rate_dict', 'usd_rate', toString(currency))) AS usd_total
+      FROM fx.payments GROUP BY month ORDER BY month;

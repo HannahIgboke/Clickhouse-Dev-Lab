@@ -1,0 +1,102 @@
+id: 33
+slug: refreshable-mv
+title: "Stretch: an hourly leaderboard with a refreshable materialized view"
+domains: [stretch]
+objectives: [S3, A3]
+tier: 2
+minutes: 10
+docs:
+  - https://clickhouse.com/docs/materialized-view/refreshable-materialized-view
+  - https://clickhouse.com/docs/sql-reference/statements/create/view#refreshable-materialized-view
+
+brief: |
+  leader.scores receives game results (player, score, ts).
+
+  1. Create a table leader.top10 (MergeTree, sorted by player) with columns
+  player String and best UInt32.
+
+  2. Create a refreshable materialized view leader.top10_mv that, every
+  hour, replaces the contents of leader.top10 with the 10 players with the
+  highest best score (max(score)).
+
+  Unlike an incremental materialized view, it re-runs its whole query on a
+  schedule, so it also sees rows inserted before it was created.
+
+reset:
+  - DROP DATABASE IF EXISTS leader SYNC
+
+setup:
+  - CREATE DATABASE leader
+  - |
+    CREATE TABLE leader.scores (player String, score UInt32, ts DateTime) ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO leader.scores
+    SELECT concat('player_', toString(cityHash64(number, {seed}, 1) % 5000)), toUInt32(cityHash64(number, {seed}, 2) % 100000),
+           toDateTime('2025-11-01 00:00:00') + number
+    FROM numbers(200000)
+
+checks:
+  - name: leader.top10_mv refreshes every hour into leader.top10
+    type: sql_true
+    points: 30
+    query: |
+      SELECT match(create_table_query, 'REFRESH EVERY 1 HOUR') AND match(create_table_query, 'TO leader\\.top10\\b')
+         AND (SELECT count() FROM system.view_refreshes WHERE database = 'leader' AND view = 'top10_mv') = 1
+      FROM system.tables WHERE database = 'leader' AND name = 'top10_mv'
+    show: SELECT create_table_query FROM system.tables WHERE database = 'leader' AND name = 'top10_mv'
+    hint: CREATE MATERIALIZED VIEW leader.top10_mv REFRESH EVERY 1 HOUR TO leader.top10 AS SELECT ...
+
+  - name: leader.top10 holds the current top 10
+    type: result
+    points: 35
+    ordered: false
+    prepare:
+      - SYSTEM REFRESH VIEW leader.top10_mv
+      - SYSTEM WAIT VIEW leader.top10_mv
+    # Several players can tie on the same best score, so compare the scores and
+    # check separately that every listed player really has that best.
+    query: |
+      SELECT toUInt64(best) AS b,
+             toUInt64((SELECT max(score) FROM leader.scores AS s WHERE s.player = t.player)) = b AS own_best
+      FROM leader.top10 AS t
+    expect: SELECT toUInt64(m) AS b, true AS own_best FROM (SELECT max(score) AS m FROM leader.scores GROUP BY player ORDER BY m DESC LIMIT 10)
+
+  - name: A refresh replaces the contents (picks up a new champion)
+    type: sql_true
+    points: 35
+    prepare:
+      - INSERT INTO leader.scores VALUES ('chlab_probe', 999999, now())
+      - SYSTEM REFRESH VIEW leader.top10_mv
+      - SYSTEM WAIT VIEW leader.top10_mv
+    query: SELECT count() = 10 AND countIf(player = 'chlab_probe') = 1 FROM leader.top10
+    show: |
+      SELECT concat(toString(count()), ' rows, probe present: ', toString(countIf(player = 'chlab_probe'))) FROM leader.top10
+    cleanup:
+      - DELETE FROM leader.scores WHERE player = 'chlab_probe'
+      - SYSTEM REFRESH VIEW leader.top10_mv
+      - SYSTEM WAIT VIEW leader.top10_mv
+    hint: Without APPEND, each refresh atomically replaces the target table's contents.
+
+solution: |
+  CREATE TABLE leader.top10 (player String, best UInt32) ENGINE = MergeTree ORDER BY player;
+
+  CREATE MATERIALIZED VIEW leader.top10_mv
+  REFRESH EVERY 1 HOUR
+  TO leader.top10
+  AS SELECT player, max(score) AS best
+     FROM leader.scores
+     GROUP BY player
+     ORDER BY best DESC
+     LIMIT 10;
+
+  SELECT * FROM system.view_refreshes WHERE view = 'top10_mv';
+
+wrong_solutions:
+  - name: incremental view instead of refreshable
+    must_fail:
+      - leader.top10_mv refreshes every hour into leader.top10
+    sql: |
+      CREATE TABLE leader.top10 (player String, best UInt32) ENGINE = MergeTree ORDER BY player;
+      CREATE MATERIALIZED VIEW leader.top10_mv TO leader.top10 AS
+      SELECT player, max(score) AS best FROM leader.scores GROUP BY player ORDER BY best DESC LIMIT 10;
+      INSERT INTO leader.top10 SELECT player, max(score) AS best FROM leader.scores GROUP BY player ORDER BY best DESC LIMIT 10;

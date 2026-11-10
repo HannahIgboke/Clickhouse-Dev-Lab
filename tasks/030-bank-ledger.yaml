@@ -1,0 +1,182 @@
+id: 30
+slug: bank-ledger
+title: "Nightmare: duplicates, corrections and erasure in one ledger"
+domains: [dedup, inserting, analyzing]
+objectives: [D1, D2, I5, A1, A3, A4]
+tier: 4
+minutes: 25
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
+  - https://clickhouse.com/docs/sql-reference/statements/delete
+  - https://clickhouse.com/docs/sql-reference/statements/select/from#final-modifier
+
+brief: |
+  bank.tx_feed is an at-least-once card transaction feed: txn_id,
+  customer_id, ts, amount, version. The same transaction can be delivered
+  several times (identical rows), and corrections arrive as the same txn_id
+  with a higher version and an amended amount. bank.erasures lists
+  customer_id values that must be erased.
+
+  1. Create bank.transactions (exactly txn_id UInt64, customer_id UInt32,
+  ts DateTime, amount Decimal(12, 2), version UInt32) so that each txn_id
+  keeps only its highest version. Sort by txn_id.
+
+  2. Load the whole feed into it.
+
+  3. Erase every transaction of the customers in bank.erasures with a
+  lightweight delete.
+
+  4. Create a view answers.monthly_spend with columns month (first day of the
+  month, a Date), customers (exact number of distinct customers) and spend
+  (sum of current amounts), ordered by month, counting each transaction once
+  at its latest version, correct before merges.
+
+reset:
+  - DROP DATABASE IF EXISTS bank SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.monthly_spend SYNC
+
+setup:
+  - CREATE DATABASE bank
+  - |
+    CREATE TABLE bank.tx_feed (txn_id UInt64, customer_id UInt32, ts DateTime, amount Decimal(12, 2), version UInt32)
+    ENGINE = MergeTree ORDER BY tuple()
+  - |
+    INSERT INTO bank.tx_feed
+    SELECT txn_id, customer_id, ts,
+           toDecimal64(round(base * (1 + v * 0.05), 2), 2) AS amount, toUInt32(v) AS version
+    FROM
+    (
+        SELECT number + 1 AS txn_id, toUInt32(1 + cityHash64(number, {seed}, 1) % 6000) AS customer_id,
+               toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 2) % (240 * 86400)) AS ts,
+               (cityHash64(number, {seed}, 3) % 200000) / 100 AS base,
+               arrayJoin(arrayConcat(range(1 + (cityHash64(number, {seed}, 4) % 3)),
+                                     if(cityHash64(number, {seed}, 5) % 5 = 0, [0], []))) AS v
+        FROM numbers(150000)
+    )
+    ORDER BY cityHash64(txn_id, v, {seed})
+  - CREATE TABLE bank.erasures (customer_id UInt32) ENGINE = MergeTree ORDER BY customer_id
+  - INSERT INTO bank.erasures SELECT DISTINCT toUInt32(1 + cityHash64(number, {seed}, 9) % 6000) FROM numbers(40)
+
+checks:
+  - name: ReplacingMergeTree(version), exact columns, sorted by txn_id
+    type: sql_true
+    points: 15
+    query: |
+      SELECT match(engine_full, '^ReplacingMergeTree\\(version\\)') AND sorting_key = 'txn_id'
+             AND (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+                   WHERE database = 'bank' AND table = 'transactions' ORDER BY position))
+                 = ['txn_id UInt64', 'customer_id UInt32', 'ts DateTime', 'amount Decimal(12, 2)', 'version UInt32']
+      FROM system.tables WHERE database = 'bank' AND name = 'transactions'
+    show: SELECT engine_full FROM system.tables WHERE database = 'bank' AND name = 'transactions'
+
+  - name: Erased customers have no transactions left
+    type: sql_true
+    points: 15
+    query: |
+      SELECT count() = 0 FROM bank.transactions WHERE customer_id IN (SELECT customer_id FROM bank.erasures)
+
+  - name: Erasure done with a lightweight DELETE
+    type: sql_true
+    points: 10
+    query: |
+      SELECT countIf(command LIKE '%_row_exists = 0%') > 0 AND countIf(command LIKE '%DELETE WHERE%') = 0
+      FROM system.mutations WHERE database = 'bank' AND table = 'transactions'
+    show: SELECT command FROM system.mutations WHERE database = 'bank' AND table = 'transactions'
+
+  - name: Current ledger is right (latest versions, nobody erased)
+    type: result
+    points: 25
+    query: |
+      SELECT count() AS n, sum(amount) AS s, groupBitXor(cityHash64(txn_id, toString(amount))) AS fp FROM bank.transactions FINAL
+    expect: |
+      SELECT count() AS n, sum(a) AS s, groupBitXor(cityHash64(txn_id, toString(a))) AS fp
+      FROM (SELECT txn_id, argMax(amount, version) AS a, any(customer_id) AS c FROM bank.tx_feed GROUP BY txn_id)
+      WHERE c NOT IN (SELECT customer_id FROM bank.erasures)
+
+  - name: answers.monthly_spend is right before merges
+    type: result
+    points: 35
+    tolerance: 0.0000001
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.tx AS bank.transactions
+      - SYSTEM STOP MERGES chlab_grader.tx
+      - INSERT INTO chlab_grader.tx SELECT * FROM bank.tx_feed WHERE version = 0 AND customer_id NOT IN (SELECT customer_id FROM bank.erasures)
+      - INSERT INTO chlab_grader.tx SELECT * FROM bank.tx_feed WHERE version = 1 AND customer_id NOT IN (SELECT customer_id FROM bank.erasures)
+      - INSERT INTO chlab_grader.tx SELECT * FROM bank.tx_feed WHERE version = 2 AND customer_id NOT IN (SELECT customer_id FROM bank.erasures)
+      - INSERT INTO chlab_grader.tx SELECT * FROM bank.tx_feed WHERE version = 0 AND customer_id NOT IN (SELECT customer_id FROM bank.erasures)
+    query: |
+      SELECT month, toUInt64(customers) AS c, toFloat64(spend) AS s
+      FROM {as_select:answers.monthly_spend|bank.transactions=>chlab_grader.tx}
+    expect: |
+      SELECT toStartOfMonth(t) AS month, uniqExact(cust) AS cu, toFloat64(sum(a)) AS s
+      FROM (SELECT txn_id, argMax(amount, version) AS a, any(customer_id) AS cust, any(ts) AS t FROM bank.tx_feed GROUP BY txn_id)
+      WHERE cust NOT IN (SELECT customer_id FROM bank.erasures)
+      GROUP BY month ORDER BY month
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: >-
+      The grader re-ran your view on a copy where old versions and duplicate deliveries sit in
+      separate, unmerged parts. Use FINAL or argMax(amount, version) per txn_id.
+
+solution: |
+  CREATE TABLE bank.transactions
+  (
+      txn_id      UInt64,
+      customer_id UInt32,
+      ts          DateTime,
+      amount      Decimal(12, 2),
+      version     UInt32
+  )
+  ENGINE = ReplacingMergeTree(version)
+  ORDER BY txn_id;
+
+  INSERT INTO bank.transactions SELECT * FROM bank.tx_feed;
+
+  DELETE FROM bank.transactions WHERE customer_id IN (SELECT customer_id FROM bank.erasures);
+
+  CREATE VIEW answers.monthly_spend AS
+  SELECT toStartOfMonth(ts) AS month, uniqExact(customer_id) AS customers, sum(amount) AS spend
+  FROM bank.transactions FINAL
+  GROUP BY month
+  ORDER BY month;
+
+alternatives:
+  - name: argMax view
+    sql: |
+      CREATE TABLE bank.transactions (txn_id UInt64, customer_id UInt32, ts DateTime, amount Decimal(12, 2), version UInt32)
+      ENGINE = ReplacingMergeTree(version) ORDER BY txn_id;
+      INSERT INTO bank.transactions SELECT * FROM bank.tx_feed;
+      DELETE FROM bank.transactions WHERE customer_id IN (SELECT customer_id FROM bank.erasures);
+      CREATE VIEW answers.monthly_spend AS
+      SELECT toStartOfMonth(t) AS month, count(DISTINCT c) AS customers, sum(a) AS spend
+      FROM (SELECT txn_id, argMax(amount, version) AS a, argMax(customer_id, version) AS c, argMax(ts, version) AS t
+            FROM bank.transactions GROUP BY txn_id)
+      GROUP BY month ORDER BY month;
+
+wrong_solutions:
+  - name: plain MergeTree, ALTER DELETE, no dedup in the view
+    must_fail:
+      - ReplacingMergeTree(version), exact columns, sorted by txn_id
+      - Erasure done with a lightweight DELETE
+      - answers.monthly_spend is right before merges
+    sql: |
+      CREATE TABLE bank.transactions (txn_id UInt64, customer_id UInt32, ts DateTime, amount Decimal(12, 2), version UInt32)
+      ENGINE = MergeTree ORDER BY txn_id;
+      INSERT INTO bank.transactions SELECT * FROM bank.tx_feed;
+      ALTER TABLE bank.transactions DELETE WHERE customer_id IN (SELECT customer_id FROM bank.erasures) SETTINGS mutations_sync = 1;
+      CREATE VIEW answers.monthly_spend AS
+      SELECT toStartOfMonth(ts) AS month, uniqExact(customer_id) AS customers, sum(amount) AS spend
+      FROM bank.transactions GROUP BY month ORDER BY month;
+  - name: erasure forgotten
+    must_fail:
+      - Erased customers have no transactions left
+      - Current ledger is right (latest versions, nobody erased)
+    sql: |
+      CREATE TABLE bank.transactions (txn_id UInt64, customer_id UInt32, ts DateTime, amount Decimal(12, 2), version UInt32)
+      ENGINE = ReplacingMergeTree(version) ORDER BY txn_id;
+      INSERT INTO bank.transactions SELECT * FROM bank.tx_feed;
+      CREATE VIEW answers.monthly_spend AS
+      SELECT toStartOfMonth(ts) AS month, uniqExact(customer_id) AS customers, sum(amount) AS spend
+      FROM bank.transactions FINAL GROUP BY month ORDER BY month;

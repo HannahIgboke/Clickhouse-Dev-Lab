@@ -1,0 +1,95 @@
+id: 21
+slug: skip-index-minmax
+title: A minmax index for large payments
+domains: [optimizing]
+objectives: [O4, M4]
+tier: 2
+minutes: 10
+docs:
+  - https://clickhouse.com/docs/optimize/skipping-indexes
+  - https://clickhouse.com/docs/sql-reference/statements/alter/skipping-index
+
+brief: |
+  payments.transactions is sorted by (merchant_id, ts). Fraud analysts often
+  run range queries on the amount, such as:
+
+    SELECT count() FROM payments.transactions WHERE amount > 50000
+
+  Large amounts only come from a small group of corporate merchants, so they
+  are concentrated in a few granules, but the primary key cannot help
+  because amount is not in it.
+
+  1. Add a skipping index named idx_amount on amount using the index type
+  that stores each granule's lowest and highest value.
+
+  2. Build it for existing data so the query above reads at most 10% of
+  granules. Do not change the table's ORDER BY.
+
+reset:
+  - DROP DATABASE IF EXISTS payments SYNC
+
+setup:
+  - CREATE DATABASE payments
+  - |
+    CREATE TABLE payments.transactions
+    (
+        txn_id      UInt64,
+        merchant_id UInt32,
+        ts          DateTime,
+        amount      Decimal(12, 2),
+        card_type   LowCardinality(String)
+    )
+    ENGINE = MergeTree ORDER BY (merchant_id, ts)
+  - |
+    INSERT INTO payments.transactions
+    SELECT number + 1, m,
+           toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 2) % (200 * 86400)),
+           toDecimal64(if(m > 990, 40000 + (cityHash64(number, {seed}, 3) % 6000000) / 100,
+                          1 + (cityHash64(number, {seed}, 3) % 2000000) / 100), 2),
+           ['visa', 'mastercard', 'verve', 'amex'][1 + (cityHash64(number, {seed}, 4) % 4)]
+    FROM (SELECT number, toUInt32(1 + cityHash64(number, {seed}, 1) % 1000) AS m FROM numbers(2000000))
+
+checks:
+  - name: idx_amount is a minmax index on amount
+    type: sql_true
+    points: 30
+    query: |
+      SELECT type = 'minmax' AND expr = 'amount'
+      FROM system.data_skipping_indices WHERE database = 'payments' AND table = 'transactions' AND name = 'idx_amount'
+    show: |
+      SELECT concat(name, ' ', type_full, ' on ', expr) FROM system.data_skipping_indices WHERE database = 'payments' AND table = 'transactions'
+
+  - name: The large-amount query reads at most 10% of granules
+    type: granules
+    stage: final
+    points: 50
+    max_ratio: 0.10
+    query: SELECT count() FROM payments.transactions WHERE amount > 50000
+    hint: ALTER TABLE ... MATERIALIZE INDEX idx_amount builds the index for data inserted before it existed.
+
+  - name: Index added, ORDER BY unchanged
+    type: sql_true
+    points: 20
+    query: |
+      SELECT sorting_key = 'merchant_id, ts'
+         AND (SELECT count() FROM system.data_skipping_indices WHERE database = 'payments' AND table = 'transactions') > 0
+      FROM system.tables WHERE database = 'payments' AND name = 'transactions'
+
+solution: |
+  ALTER TABLE payments.transactions ADD INDEX idx_amount amount TYPE minmax GRANULARITY 1;
+  ALTER TABLE payments.transactions MATERIALIZE INDEX idx_amount SETTINGS mutations_sync = 1;
+
+  EXPLAIN indexes = 1 SELECT count() FROM payments.transactions WHERE amount > 50000;
+
+wrong_solutions:
+  - name: set index on a high-cardinality column
+    must_fail:
+      - idx_amount is a minmax index on amount
+    sql: |
+      ALTER TABLE payments.transactions ADD INDEX idx_amount amount TYPE set(100) GRANULARITY 1;
+      ALTER TABLE payments.transactions MATERIALIZE INDEX idx_amount SETTINGS mutations_sync = 1;
+  - name: not materialized
+    must_fail:
+      - The large-amount query reads at most 10% of granules
+    sql: |
+      ALTER TABLE payments.transactions ADD INDEX idx_amount amount TYPE minmax GRANULARITY 1;

@@ -1,0 +1,165 @@
+id: 13
+slug: country-dictionary
+title: Enrich queries with a dictionary
+domains: [modeling, analyzing]
+objectives: [M5, A1, A3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/create/dictionary
+  - https://clickhouse.com/docs/sql-reference/dictionaries
+  - https://clickhouse.com/docs/sql-reference/functions/ext-dict-functions
+
+brief: |
+  intl.countries maps two-letter country codes to a name, region and
+  currency. intl.signups has one row per user signup with a country_code.
+
+  1. Create a dictionary intl.country_dict whose source is the table
+  intl.countries, keyed by code (a String), with the attributes name and
+  region. Pick a memory layout that supports a String key.
+
+  2. Create a view answers.signups_by_region that uses the dictionary (not a
+  JOIN) to count signups per region, with columns region and signups, most
+  signups first. Some signups have codes that are not in intl.countries: count
+  those under the region 'Unknown'.
+
+reset:
+  - DROP DATABASE IF EXISTS intl SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.signups_by_region SYNC
+
+setup:
+  - CREATE DATABASE intl
+  - |
+    CREATE TABLE intl.countries
+    (
+        code     String,
+        name     String,
+        region   LowCardinality(String),
+        currency LowCardinality(String)
+    )
+    ENGINE = MergeTree ORDER BY code
+  - |
+    INSERT INTO intl.countries VALUES
+      ('NG', 'Nigeria', 'Africa', 'NGN'), ('GH', 'Ghana', 'Africa', 'GHS'), ('KE', 'Kenya', 'Africa', 'KES'),
+      ('ZA', 'South Africa', 'Africa', 'ZAR'), ('EG', 'Egypt', 'Africa', 'EGP'), ('US', 'United States', 'Americas', 'USD'),
+      ('CA', 'Canada', 'Americas', 'CAD'), ('BR', 'Brazil', 'Americas', 'BRL'), ('MX', 'Mexico', 'Americas', 'MXN'),
+      ('GB', 'United Kingdom', 'Europe', 'GBP'), ('DE', 'Germany', 'Europe', 'EUR'), ('FR', 'France', 'Europe', 'EUR'),
+      ('ES', 'Spain', 'Europe', 'EUR'), ('IN', 'India', 'Asia', 'INR'), ('JP', 'Japan', 'Asia', 'JPY'),
+      ('SG', 'Singapore', 'Asia', 'SGD'), ('AU', 'Australia', 'Oceania', 'AUD'), ('NZ', 'New Zealand', 'Oceania', 'NZD')
+  - |
+    CREATE TABLE intl.signups (user_id UInt64, country_code String, signup_ts DateTime)
+    ENGINE = MergeTree ORDER BY signup_ts
+  - |
+    INSERT INTO intl.signups
+    SELECT number + 1,
+           ['NG', 'NG', 'NG', 'GH', 'KE', 'ZA', 'EG', 'US', 'US', 'CA', 'BR', 'MX', 'GB', 'DE', 'FR', 'ES',
+            'IN', 'IN', 'JP', 'SG', 'AU', 'NZ', 'XX', 'ZZ', ''][1 + (cityHash64(number, {seed}, 1) % 25)],
+           toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 2) % (200 * 86400))
+    FROM numbers(150000)
+
+checks:
+  - name: intl.country_dict is a dictionary sourced from intl.countries
+    type: sql_true
+    points: 15
+    prepare:
+      - SELECT dictGetOrNull('intl.country_dict', 'region', 'NG')
+    query: |
+      SELECT count() = 1 FROM system.dictionaries
+      WHERE database = 'intl' AND name = 'country_dict' AND source LIKE '%countries%'
+    show: |
+      SELECT concat(name, ' source: ', source) FROM system.dictionaries WHERE database = 'intl'
+    hint: CREATE DICTIONARY intl.country_dict (...) PRIMARY KEY code SOURCE(CLICKHOUSE(DB 'intl' TABLE 'countries')) ...
+
+  - name: Keyed by the String code, with name and region attributes
+    type: sql_true
+    points: 20
+    prepare:
+      - SELECT dictGet('intl.country_dict', 'region', 'NG')
+    query: |
+      SELECT `key.names` = ['code'] AND `key.types` = ['String'] AND has(`attribute.names`, 'name') AND has(`attribute.names`, 'region')
+      FROM system.dictionaries WHERE database = 'intl' AND name = 'country_dict'
+    show: |
+      SELECT concat(toString(`key.names`), ' ', toString(`key.types`), ' attrs ', toString(`attribute.names`))
+      FROM system.dictionaries WHERE database = 'intl' AND name = 'country_dict'
+
+  - name: The dictionary loads and returns the right values
+    type: sql_true
+    points: 15
+    query: |
+      SELECT dictGet('intl.country_dict', 'name', 'KE') = 'Kenya'
+         AND dictGet('intl.country_dict', 'region', 'JP') = 'Asia'
+         AND (SELECT status FROM system.dictionaries WHERE database = 'intl' AND name = 'country_dict') = 'LOADED'
+    hint: >-
+      A String key needs a COMPLEX_KEY_* layout, e.g. LAYOUT(COMPLEX_KEY_HASHED()). Check for
+      load errors in system.dictionaries.last_exception.
+
+  - name: answers.signups_by_region uses the dictionary
+    type: sql_true
+    points: 15
+    query: |
+      SELECT engine = 'View' AND positionCaseInsensitive(as_select, 'dictGet') > 0 AND positionCaseInsensitive(as_select, 'JOIN') = 0
+      FROM system.tables WHERE database = 'answers' AND name = 'signups_by_region'
+    show: SELECT as_select FROM system.tables WHERE database = 'answers' AND name = 'signups_by_region'
+
+  - name: Signups per region, Unknown included, most first
+    type: result
+    points: 35
+    query: SELECT toString(region) AS region, signups FROM answers.signups_by_region
+    expect: |
+      SELECT if(c.region = '', 'Unknown', c.region) AS region, count() AS signups
+      FROM intl.signups AS s LEFT JOIN intl.countries AS c ON s.country_code = c.code
+      GROUP BY region ORDER BY signups DESC
+    hint: dictGetOrDefault('intl.country_dict', 'region', country_code, 'Unknown')
+
+solution: |
+  CREATE DICTIONARY intl.country_dict
+  (
+      code   String,
+      name   String,
+      region String
+  )
+  PRIMARY KEY code
+  SOURCE(CLICKHOUSE(DB 'intl' TABLE 'countries'))
+  LAYOUT(COMPLEX_KEY_HASHED())
+  LIFETIME(MIN 0 MAX 3600);
+
+  SELECT dictGet('intl.country_dict', 'name', 'NG');
+
+  CREATE VIEW answers.signups_by_region AS
+  SELECT dictGetOrDefault('intl.country_dict', 'region', country_code, 'Unknown') AS region,
+         count() AS signups
+  FROM intl.signups
+  GROUP BY region
+  ORDER BY signups DESC;
+
+alternatives:
+  - name: COMPLEX_KEY_HASHED_ARRAY layout, dictHas
+    sql: |
+      CREATE DICTIONARY intl.country_dict (code String, name String, region String DEFAULT 'Unknown')
+      PRIMARY KEY code SOURCE(CLICKHOUSE(TABLE 'countries' DB 'intl')) LAYOUT(COMPLEX_KEY_HASHED_ARRAY()) LIFETIME(300);
+      CREATE VIEW answers.signups_by_region AS
+      SELECT if(dictHas('intl.country_dict', country_code), dictGet('intl.country_dict', 'region', country_code), 'Unknown') AS region,
+             count() AS signups
+      FROM intl.signups GROUP BY region ORDER BY signups DESC;
+
+wrong_solutions:
+  - name: unknown codes dropped
+    must_fail:
+      - Signups per region, Unknown included, most first
+    sql: |
+      CREATE DICTIONARY intl.country_dict (code String, name String, region String)
+      PRIMARY KEY code SOURCE(CLICKHOUSE(DB 'intl' TABLE 'countries')) LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(0);
+      CREATE VIEW answers.signups_by_region AS
+      SELECT dictGet('intl.country_dict', 'region', country_code) AS region, count() AS signups
+      FROM intl.signups WHERE dictHas('intl.country_dict', country_code) GROUP BY region ORDER BY signups DESC;
+  - name: JOIN instead of the dictionary
+    must_fail:
+      - answers.signups_by_region uses the dictionary
+    sql: |
+      CREATE DICTIONARY intl.country_dict (code String, name String, region String)
+      PRIMARY KEY code SOURCE(CLICKHOUSE(DB 'intl' TABLE 'countries')) LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(0);
+      CREATE VIEW answers.signups_by_region AS
+      SELECT if(c.region = '', 'Unknown', c.region) AS region, count() AS signups
+      FROM intl.signups AS s LEFT JOIN intl.countries AS c ON s.country_code = c.code
+      GROUP BY region ORDER BY signups DESC;

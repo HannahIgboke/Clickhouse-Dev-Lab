@@ -1,0 +1,116 @@
+id: 8
+slug: reviews-parquet-s3
+title: Load a Parquet file from S3 with tight types
+domains: [inserting, modeling]
+objectives: [I2, I3, M2, M3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/table-functions/s3
+  - https://clickhouse.com/docs/interfaces/formats/Parquet
+  - https://clickhouse.com/docs/integrations/data-formats/parquet
+
+brief: |
+  A Parquet file of product reviews is in an S3 bucket:
+
+    URL:         {s3}/reviews/reviews_2025.parquet
+    Access key:  {s3_key}
+    Secret key:  {s3_secret}
+
+  1. Create a database reviews and a MergeTree table reviews.reviews with the
+  same column names as the file. Choose the most efficient types: the file has
+  no nulls, so nothing should be Nullable; ratings are 1-5; marketplace holds a
+  few two-letter codes; review_date has no time part.
+
+  2. Sort the table by product_id, then review_date.
+
+  3. Load the whole file from S3 into reviews.reviews.
+
+reset:
+  - DROP DATABASE IF EXISTS reviews SYNC
+
+setup:
+  - |
+    INSERT INTO FUNCTION s3('{s3}/reviews/reviews_2025.parquet', '{s3_key}', '{s3_secret}', 'Parquet')
+    SELECT
+        toUInt32(number + 1) AS review_id,
+        toUInt32(1 + cityHash64(number, {seed}, 1) % 20000) AS product_id,
+        toUInt8(1 + (cityHash64(number, {seed}, 2) % 5)) AS rating,
+        concat(['Great', 'Okay', 'Broke fast', 'Love it', 'Not as shown'][1 + (cityHash64(number, {seed}, 3) % 5)], ' #', toString(number)) AS title,
+        repeat('lorem ipsum ', 1 + (cityHash64(number, {seed}, 4) % 8)) AS body,
+        (cityHash64(number, {seed}, 5) % 4) != 0 AS verified,
+        ['US', 'GB', 'DE', 'FR', 'JP', 'NG'][1 + (cityHash64(number, {seed}, 6) % 6)] AS marketplace,
+        toDate('2025-01-01') + (cityHash64(number, {seed}, 7) % 300) AS review_date
+    FROM numbers(300000)
+
+checks:
+  - name: reviews.reviews is a MergeTree table sorted by (product_id, review_date)
+    type: sql_true
+    points: 15
+    query: |
+      SELECT engine = 'MergeTree' AND sorting_key = 'product_id, review_date'
+      FROM system.tables WHERE database = 'reviews' AND name = 'reviews'
+    show: |
+      SELECT concat(engine, ' ORDER BY ', sorting_key) FROM system.tables WHERE database = 'reviews' AND name = 'reviews'
+
+  - name: Efficient, non-Nullable types
+    type: column_types
+    points: 35
+    table: reviews.reviews
+    columns:
+      review_id: ['UInt32', 'UInt64']
+      product_id: ['UInt32']
+      rating: ['UInt8', 'Enum8\(.*\)']
+      title: ['String']
+      body: ['String']
+      verified: ['Bool', 'UInt8']
+      marketplace: ['LowCardinality\(String\)', 'FixedString\(2\)', 'LowCardinality\(FixedString\(2\)\)', 'Enum8\(.*\)']
+      review_date: ['Date']
+    hint: >-
+      Parquet inference gives Nullable types and 64-bit integers. Define the table yourself:
+      UInt8 for ratings, LowCardinality(String) or FixedString(2) for marketplace, Date for review_date.
+
+  - name: All rows loaded from S3, values intact
+    type: result
+    points: 50
+    query: |
+      SELECT count() AS rows, sum(rating) AS ratings, countIf(verified) AS verified,
+             groupBitXor(cityHash64(review_id, product_id, toString(marketplace), toString(review_date), title)) AS fp
+      FROM reviews.reviews
+    expect: |
+      SELECT count() AS rows, sum(rating) AS ratings, countIf(verified) AS verified,
+             groupBitXor(cityHash64(review_id, product_id, toString(marketplace), toString(review_date), title)) AS fp
+      FROM s3('{s3}/reviews/reviews_2025.parquet', '{s3_key}', '{s3_secret}', 'Parquet')
+    hint: INSERT INTO reviews.reviews SELECT * FROM s3('<url>', '<key>', '<secret>', 'Parquet')
+
+solution: |
+  DESCRIBE s3('{s3}/reviews/reviews_2025.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+
+  CREATE DATABASE reviews;
+
+  CREATE TABLE reviews.reviews
+  (
+      review_id   UInt32,
+      product_id  UInt32,
+      rating      UInt8,
+      title       String,
+      body        String,
+      verified    Bool,
+      marketplace LowCardinality(String),
+      review_date Date
+  )
+  ENGINE = MergeTree
+  ORDER BY (product_id, review_date);
+
+  INSERT INTO reviews.reviews
+  SELECT * FROM s3('{s3}/reviews/reviews_2025.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+
+wrong_solutions:
+  - name: CREATE AS SELECT with inferred types
+    must_fail:
+      - Efficient, non-Nullable types
+      - reviews.reviews is a MergeTree table sorted by (product_id, review_date)
+    sql: |
+      CREATE DATABASE reviews;
+      CREATE TABLE reviews.reviews ENGINE = MergeTree ORDER BY tuple() AS
+      SELECT * FROM s3('{s3}/reviews/reviews_2025.parquet', '{s3_key}', '{s3_secret}', 'Parquet');

@@ -1,0 +1,26 @@
+name: Task idea
+description: Suggest a new practice task
+labels: [new-task]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Please base ideas on the published exam objectives and the public docs only.
+        Ideas taken from the real exam cannot be accepted.
+  - type: input
+    id: objectives
+    attributes:
+      label: Objective codes (see `chlab report`)
+      placeholder: "O2, A4"
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The scenario and what the candidate must build
+    validations:
+      required: true
+  - type: textarea
+    id: traps
+    attributes:
+      label: Mistakes it should catch

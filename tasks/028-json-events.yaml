@@ -1,0 +1,121 @@
+id: 28
+slug: json-events
+title: Metrics from JSON payloads
+domains: [analyzing]
+objectives: [A2, A3, A1]
+tier: 3
+minutes: 14
+docs:
+  - https://clickhouse.com/docs/sql-reference/functions/json-functions
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/avg
+
+brief: |
+  app.events stores raw tracking events: ts, user_id and payload, a String
+  holding JSON such as
+
+    {"type":"purchase","props":{"amount":19.99,"currency":"NGN","items":["a1","b7"]}}
+    {"type":"page_view","props":{"path":"/home"}}
+
+  Create a view answers.purchases_by_currency over purchase events only
+  (type = "purchase") with one row per currency, highest revenue first,
+  columns:
+
+    currency   props.currency
+    purchases  the number of purchase events
+    revenue    the sum of props.amount, rounded to 2 decimals
+    avg_items  the average number of elements in props.items, rounded to 2 decimals
+    buyers     the exact number of distinct user_id
+
+reset:
+  - DROP DATABASE IF EXISTS app SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.purchases_by_currency SYNC
+
+setup:
+  - CREATE DATABASE app
+  - |
+    CREATE TABLE app.events (ts DateTime, user_id UInt64, payload String)
+    ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO app.events
+    SELECT toDateTime('2025-10-01 00:00:00') + (cityHash64(number, {seed}, 1) % (20 * 86400)),
+           cityHash64(number, {seed}, 2) % 30000,
+           if(t = 'purchase',
+              concat('{"type":"purchase","props":{"amount":', toString(round(1 + (cityHash64(number, {seed}, 4) % 50000) / 100, 2)),
+                     ',"currency":"', ['NGN', 'USD', 'GHS', 'EUR', 'KES'][1 + (cityHash64(number, {seed}, 5) % 5)],
+                     '","items":[', arrayStringConcat(arrayMap(i -> concat('"i', toString(i), '"'), range(1 + (cityHash64(number, {seed}, 6) % 6))), ','),
+                     ']}}'),
+              concat('{"type":"', t, '","props":{"path":"/p/', toString(cityHash64(number, {seed}, 7) % 50), '"}}'))
+    FROM (SELECT number, ['page_view', 'page_view', 'page_view', 'click', 'purchase', 'signup'][1 + (cityHash64(number, {seed}, 3) % 6)] AS t
+          FROM numbers(400000))
+
+checks:
+  - name: answers.purchases_by_currency has the five columns
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['currency', 'purchases', 'revenue', 'avg_items', 'buyers']
+      FROM (SELECT name FROM system.columns WHERE database = 'answers' AND table = 'purchases_by_currency' ORDER BY position)
+    show: SELECT name FROM system.columns WHERE database = 'answers' AND table = 'purchases_by_currency' ORDER BY position
+
+  - name: Purchases and revenue per currency, highest revenue first
+    type: result
+    points: 40
+    tolerance: 0.0000001
+    query: SELECT currency, toUInt64(purchases) AS n, toFloat64(revenue) AS r FROM answers.purchases_by_currency
+    expect: |
+      SELECT JSONExtractString(payload, 'props', 'currency') AS currency, count() AS n,
+             round(sum(JSONExtractFloat(payload, 'props', 'amount')), 2) AS r
+      FROM app.events WHERE JSONExtractString(payload, 'type') = 'purchase'
+      GROUP BY currency ORDER BY r DESC
+    hint: JSONExtractString(payload, 'type') and JSONExtractFloat(payload, 'props', 'amount') reach into nested keys.
+
+  - name: Average item count and exact buyers
+    type: result
+    points: 50
+    ordered: false
+    tolerance: 0.0000001
+    query: SELECT currency, toFloat64(avg_items) AS a, toUInt64(buyers) AS b FROM answers.purchases_by_currency
+    expect: |
+      SELECT JSONExtractString(payload, 'props', 'currency') AS currency,
+             round(avg(JSONLength(payload, 'props', 'items')), 2) AS a, uniqExact(user_id) AS b
+      FROM app.events WHERE JSONExtractString(payload, 'type') = 'purchase'
+      GROUP BY currency
+    hint: JSONLength(payload, 'props', 'items') counts the elements of a JSON array.
+
+solution: |
+  SELECT payload FROM app.events LIMIT 5;
+
+  CREATE VIEW answers.purchases_by_currency AS
+  SELECT
+      JSONExtractString(payload, 'props', 'currency')                 AS currency,
+      count()                                                         AS purchases,
+      round(sum(JSONExtractFloat(payload, 'props', 'amount')), 2)     AS revenue,
+      round(avg(JSONLength(payload, 'props', 'items')), 2)            AS avg_items,
+      uniqExact(user_id)                                              AS buyers
+  FROM app.events
+  WHERE JSONExtractString(payload, 'type') = 'purchase'
+  GROUP BY currency
+  ORDER BY revenue DESC;
+
+alternatives:
+  - name: simpleJSON / JSONExtractArrayRaw
+    sql: |
+      CREATE VIEW answers.purchases_by_currency AS
+      SELECT JSON_VALUE(payload, '$.props.currency') AS currency, count() AS purchases,
+             round(sum(toFloat64(JSON_VALUE(payload, '$.props.amount'))), 2) AS revenue,
+             round(avg(length(JSONExtractArrayRaw(payload, 'props', 'items'))), 2) AS avg_items,
+             count(DISTINCT user_id) AS buyers
+      FROM app.events WHERE JSON_VALUE(payload, '$.type') = 'purchase'
+      GROUP BY currency ORDER BY revenue DESC;
+
+wrong_solutions:
+  - name: substring match on purchase, length of the raw string
+    must_fail:
+      - Average item count and exact buyers
+    sql: |
+      CREATE VIEW answers.purchases_by_currency AS
+      SELECT JSONExtractString(payload, 'props', 'currency') AS currency, count() AS purchases,
+             round(sum(JSONExtractFloat(payload, 'props', 'amount')), 2) AS revenue,
+             round(avg(length(JSONExtractRaw(payload, 'props', 'items'))), 2) AS avg_items, uniq(user_id) AS buyers
+      FROM app.events WHERE payload LIKE '%purchase%' GROUP BY currency ORDER BY revenue DESC;

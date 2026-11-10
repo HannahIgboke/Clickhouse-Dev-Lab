@@ -1,0 +1,164 @@
+id: 24
+slug: cdc-replacing-deletes
+title: A CDC feed with deletes in ReplacingMergeTree
+domains: [dedup, inserting]
+objectives: [D2, I4, I5]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree#is_deleted
+  - https://clickhouse.com/docs/guides/replacing-merge-tree
+
+brief: |
+  cdc.feed is a change stream from a bank's accounts database. Each row has
+  op ('c' = create, 'u' = update, 'd' = delete), account_id, name, balance
+  and lsn (a log sequence number that only goes up). An account can have many
+  events; after a 'd' event the account no longer exists.
+
+  1. Create cdc.accounts with exactly the columns
+  account_id UInt64, name String, balance Decimal(14, 2), lsn UInt64,
+  is_deleted UInt8, using ReplacingMergeTree so that the row with the highest
+  lsn wins and deletes are understood by the engine (use lsn as the version
+  and is_deleted as the deleted flag). Sort by account_id.
+
+  2. Load the whole feed into it, setting is_deleted to 1 for 'd' events and
+  0 otherwise.
+
+  3. Create a view answers.active_accounts with one row and the columns
+  accounts (how many accounts currently exist) and total_balance (their
+  summed balance). It must be correct before merges.
+
+reset:
+  - DROP DATABASE IF EXISTS cdc SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.active_accounts SYNC
+
+setup:
+  - CREATE DATABASE cdc
+  - |
+    CREATE TABLE cdc.feed (op FixedString(1), account_id UInt64, name String, balance Decimal(14, 2), lsn UInt64)
+    ENGINE = MergeTree ORDER BY lsn
+  - |
+    INSERT INTO cdc.feed
+    SELECT if(k = 0, 'c', if(k = n - 1 AND cityHash64(a, {seed}, 2) % 8 = 0, 'd', 'u')),
+           a, concat('Holder ', toString(a)),
+           toDecimal64(round((cityHash64(a, k, {seed}, 3) % 10000000) / 100, 2), 2),
+           a * 10 + k
+    FROM (SELECT number + 1 AS a, 1 + (cityHash64(number, {seed}, 1) % 5) AS n, arrayJoin(range(n)) AS k FROM numbers(15000))
+
+checks:
+  - name: ReplacingMergeTree(lsn, is_deleted) with the specified columns, sorted by account_id
+    type: sql_true
+    points: 20
+    query: |
+      SELECT match(engine_full, '^ReplacingMergeTree\\(lsn, is_deleted\\)') AND sorting_key = 'account_id'
+             AND (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+                   WHERE database = 'cdc' AND table = 'accounts' ORDER BY position))
+                 = ['account_id UInt64', 'name String', 'balance Decimal(14, 2)', 'lsn UInt64', 'is_deleted UInt8']
+      FROM system.tables WHERE database = 'cdc' AND name = 'accounts'
+    show: SELECT concat(engine_full) FROM system.tables WHERE database = 'cdc' AND name = 'accounts'
+    hint: ENGINE = ReplacingMergeTree(lsn, is_deleted) ORDER BY account_id
+
+  - name: Feed loaded with is_deleted set for 'd' events
+    type: result
+    points: 20
+    query: |
+      SELECT count() AS accounts, countIf(d = 1) AS deleted, groupBitXor(cityHash64(account_id, d)) AS fp
+      FROM (SELECT account_id, argMax(is_deleted, lsn) AS d FROM cdc.accounts GROUP BY account_id)
+    expect: |
+      SELECT count() AS accounts, countIf(d = 1) AS deleted, groupBitXor(cityHash64(account_id, d)) AS fp
+      FROM (SELECT account_id, toUInt8(argMax(op, lsn) = 'd') AS d FROM cdc.feed GROUP BY account_id)
+    hint: "Map the op while inserting: op = 'd' AS is_deleted (or if(op = 'd', 1, 0))."
+
+  - name: FINAL shows exactly the live accounts with their latest values
+    type: result
+    points: 20
+    query: |
+      SELECT count() AS n, sum(balance) AS b, groupBitXor(cityHash64(account_id, toString(balance))) AS fp FROM cdc.accounts FINAL
+    expect: |
+      SELECT count() AS n, sum(balance) AS b, groupBitXor(cityHash64(account_id, toString(balance))) AS fp
+      FROM (SELECT account_id, argMax(balance, lsn) AS balance, argMax(op, lsn) AS last_op FROM cdc.feed GROUP BY account_id)
+      WHERE last_op != 'd'
+
+  - name: A later delete removes an account, whatever the insert order
+    type: sql_true
+    points: 15
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.acc AS cdc.accounts
+      - SYSTEM STOP MERGES chlab_grader.acc
+      - INSERT INTO chlab_grader.acc (account_id, name, balance, lsn, is_deleted) VALUES (999999, 'probe', 0, 900, 1)
+      - INSERT INTO chlab_grader.acc (account_id, name, balance, lsn, is_deleted) VALUES (999999, 'probe', 50, 800, 0)
+    query: SELECT count() = 0 FROM chlab_grader.acc FINAL WHERE account_id = 999999
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+
+  - name: answers.active_accounts is right on unmerged data
+    type: result
+    points: 25
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.unmerged AS cdc.accounts
+      - SYSTEM STOP MERGES chlab_grader.unmerged
+      - INSERT INTO chlab_grader.unmerged SELECT account_id, name, balance, lsn, op = 'd' FROM cdc.feed WHERE lsn % 10 = 0
+      - INSERT INTO chlab_grader.unmerged SELECT account_id, name, balance, lsn, op = 'd' FROM cdc.feed WHERE lsn % 10 IN (1, 2)
+      - INSERT INTO chlab_grader.unmerged SELECT account_id, name, balance, lsn, op = 'd' FROM cdc.feed WHERE lsn % 10 > 2
+    query: SELECT toUInt64(accounts) AS accounts, toFloat64(total_balance) AS total FROM {as_select:answers.active_accounts|cdc.accounts=>chlab_grader.unmerged}
+    expect: |
+      SELECT count() AS accounts, toFloat64(sum(balance)) AS total
+      FROM (SELECT argMax(balance, lsn) AS balance, argMax(op, lsn) AS last_op FROM cdc.feed GROUP BY account_id)
+      WHERE last_op != 'd'
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: SELECT count() AS accounts, sum(balance) AS total_balance FROM cdc.accounts FINAL. FINAL also drops rows whose latest version is deleted.
+
+solution: |
+  CREATE TABLE cdc.accounts
+  (
+      account_id UInt64,
+      name       String,
+      balance    Decimal(14, 2),
+      lsn        UInt64,
+      is_deleted UInt8
+  )
+  ENGINE = ReplacingMergeTree(lsn, is_deleted)
+  ORDER BY account_id;
+
+  INSERT INTO cdc.accounts
+  SELECT account_id, name, balance, lsn, op = 'd' AS is_deleted FROM cdc.feed;
+
+  CREATE VIEW answers.active_accounts AS
+  SELECT count() AS accounts, sum(balance) AS total_balance
+  FROM cdc.accounts FINAL;
+
+alternatives:
+  - name: argMax view instead of FINAL
+    sql: |
+      CREATE TABLE cdc.accounts (account_id UInt64, name String, balance Decimal(14, 2), lsn UInt64, is_deleted UInt8)
+      ENGINE = ReplacingMergeTree(lsn, is_deleted) ORDER BY account_id;
+      INSERT INTO cdc.accounts SELECT account_id, name, balance, lsn, if(op = 'd', 1, 0) FROM cdc.feed;
+      CREATE VIEW answers.active_accounts AS
+      SELECT count() AS accounts, sum(b) AS total_balance
+      FROM (SELECT account_id, argMax(balance, lsn) AS b, argMax(is_deleted, lsn) AS d FROM cdc.accounts GROUP BY account_id)
+      WHERE d = 0;
+
+wrong_solutions:
+  - name: deletes ignored by the engine
+    must_fail:
+      - ReplacingMergeTree(lsn, is_deleted) with the specified columns, sorted by account_id
+      - FINAL shows exactly the live accounts with their latest values
+      - A later delete removes an account, whatever the insert order
+    sql: |
+      CREATE TABLE cdc.accounts (account_id UInt64, name String, balance Decimal(14, 2), lsn UInt64, is_deleted UInt8)
+      ENGINE = ReplacingMergeTree(lsn) ORDER BY account_id;
+      INSERT INTO cdc.accounts SELECT account_id, name, balance, lsn, op = 'd' FROM cdc.feed;
+      CREATE VIEW answers.active_accounts AS SELECT count() AS accounts, sum(balance) AS total_balance FROM cdc.accounts FINAL;
+  - name: view without FINAL
+    must_fail:
+      - answers.active_accounts is right on unmerged data
+    sql: |
+      CREATE TABLE cdc.accounts (account_id UInt64, name String, balance Decimal(14, 2), lsn UInt64, is_deleted UInt8)
+      ENGINE = ReplacingMergeTree(lsn, is_deleted) ORDER BY account_id;
+      INSERT INTO cdc.accounts SELECT account_id, name, balance, lsn, op = 'd' FROM cdc.feed;
+      CREATE VIEW answers.active_accounts AS
+      SELECT count() AS accounts, sum(balance) AS total_balance FROM cdc.accounts WHERE is_deleted = 0;

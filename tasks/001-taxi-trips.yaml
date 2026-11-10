@@ -1,0 +1,206 @@
+id: 1
+slug: taxi-trips
+title: Model and load a taxi trips file
+domains: [modeling, inserting]
+objectives: [M1, M2, M3, M4, I1, I3]
+tier: 2
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/sql-reference/data-types
+  - https://clickhouse.com/docs/best-practices/choosing-a-primary-key
+  - https://clickhouse.com/docs/interfaces/formats/CSVWithNames
+
+brief: |
+  The file /data/trips.csv holds 500,000 taxi trips in CSV format with a header
+  row. Inspect it first (hint: you can query a file directly before loading it).
+
+  1. Create a database named nyc.
+
+  2. Create a table nyc.trips using the MergeTree engine, with one column per
+  column in the file, using the same column names.
+
+  3. Choose the most efficient data type for every column. The file contains no
+  nulls, so no column should be Nullable. Money columns (fare_amount,
+  tip_amount) must be exact: no floating-point types for money.
+
+  4. Almost every query on this table filters on a single pickup_borough and a
+  range of pickup_datetime. Define the primary key so these queries read as
+  little data as possible.
+
+  5. Insert all rows of /data/trips.csv into nyc.trips.
+
+reset:
+  - DROP DATABASE IF EXISTS nyc SYNC
+
+files:
+  - path: trips.csv
+    format: CSVWithNames
+    query: |
+      SELECT
+          toUInt32(number + 1) AS trip_id,
+          toDateTime('2025-01-01 00:00:00', 'UTC') + (cityHash64(number, {seed}, 1) % (90 * 86400)) AS pickup_datetime,
+          pickup_datetime + 120 + (cityHash64(number, {seed}, 2) % 3480) AS dropoff_datetime,
+          multiIf(h < 45, 'Manhattan', h < 65, 'Brooklyn', h < 82, 'Queens', h < 92, 'Bronx',
+                  h < 97, 'EWR', 'Staten Island') AS pickup_borough,
+          toUInt8(1 + (cityHash64(number, {seed}, 4) % 6)) AS passenger_count,
+          round((cityHash64(number, {seed}, 5) % 2500) / 100 + 0.3, 2) AS trip_distance,
+          toDecimal32(round(3 + trip_distance * 2.5, 2), 2) AS fare_amount,
+          ['Card', 'Card', 'Card', 'Cash', 'Cash', 'No Charge', 'Dispute'][1 + (cityHash64(number, {seed}, 6) % 7)] AS payment_type,
+          toDecimal32(if(payment_type = 'Card', round(fare_amount * (cityHash64(number, {seed}, 7) % 30) / 100, 2), 0), 2) AS tip_amount
+      FROM (SELECT number, cityHash64(number, {seed}, 3) % 100 AS h FROM numbers(500000))
+      ORDER BY trip_id
+      SETTINGS output_format_csv_crlf_end_of_line = 0
+
+checks:
+  - name: Database nyc exists
+    type: sql_true
+    points: 5
+    query: SELECT count() = 1 FROM system.databases WHERE name = 'nyc'
+
+  - name: Table nyc.trips uses the MergeTree engine
+    type: sql_true
+    points: 10
+    query: SELECT engine = 'MergeTree' FROM system.tables WHERE database = 'nyc' AND name = 'trips'
+    show: SELECT engine FROM system.tables WHERE database = 'nyc' AND name = 'trips'
+    hint: The task asks for plain MergeTree. CREATE TABLE ... ENGINE = MergeTree ORDER BY (...).
+
+  - name: Columns match the file, and none is Nullable
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['trip_id','pickup_datetime','dropoff_datetime','pickup_borough',
+                                 'passenger_count','trip_distance','fare_amount','payment_type','tip_amount']
+             AND countIf(type LIKE '%Nullable%') = 0
+      FROM (SELECT name, type FROM system.columns WHERE database = 'nyc' AND table = 'trips' ORDER BY position)
+    show: |
+      SELECT concat(name, ' ', type) FROM system.columns
+      WHERE database = 'nyc' AND table = 'trips' ORDER BY position
+    hint: Column names and order should mirror the file header. Schema inference makes everything Nullable; tighten it yourself.
+
+  - name: Efficient data types for every column
+    type: column_types
+    points: 25
+    table: nyc.trips
+    columns:
+      trip_id: ['UInt32']
+      pickup_datetime: ['DateTime', "DateTime\\('[^']*'\\)"]
+      dropoff_datetime: ['DateTime', "DateTime\\('[^']*'\\)"]
+      pickup_borough: ['LowCardinality\(String\)', 'Enum8\(.*\)']
+      passenger_count: ['UInt8']
+      trip_distance: ['Float32', 'Decimal\((\d), 2\)', 'Decimal\(9, 2\)']
+      fare_amount: ['Decimal\((\d), 2\)', 'Decimal\(9, 2\)']
+      payment_type: ['LowCardinality\(String\)', 'Enum8\(.*\)']
+      tip_amount: ['Decimal\((\d), 2\)', 'Decimal\(9, 2\)']
+    hint: >-
+      Pick the smallest type that safely holds the values: 500,000 ids fit UInt32; a passenger
+      count fits UInt8; a handful of repeated strings suits LowCardinality(String) or Enum8;
+      second-precision timestamps need DateTime, not DateTime64; money needs Decimal(P, 2) with P up to 9 (Decimal32).
+
+  - name: Primary key starts with pickup_borough, then pickup_datetime
+    type: sql_true
+    points: 15
+    query: |
+      SELECT match(primary_key, '^pickup_borough, [^,]*pickup_datetime')
+      FROM system.tables WHERE database = 'nyc' AND name = 'trips'
+    show: SELECT primary_key FROM system.tables WHERE database = 'nyc' AND name = 'trips'
+    hint: >-
+      Order key columns by how queries filter: the equality filter on the low-cardinality column
+      first, then the range column.
+
+  - name: A typical query skips at least 90% of granules
+    type: granules
+    points: 15
+    max_ratio: 0.10
+    query: |
+      SELECT count() FROM nyc.trips
+      WHERE pickup_borough = 'Queens'
+        AND pickup_datetime >= '2025-02-01 00:00:00' AND pickup_datetime < '2025-02-08 00:00:00'
+    hint: Check yourself with EXPLAIN indexes = 1 SELECT ... and look at the PrimaryKey granules line.
+
+  - name: All 500,000 rows loaded, exactly as in the file
+    type: result
+    points: 20
+    query: |
+      SELECT count() AS rows, sum(fare_amount) AS fares, sum(tip_amount) AS tips,
+             uniqExact(trip_id) AS ids, countIf(pickup_borough = 'Staten Island') AS si,
+             groupBitXor(cityHash64(trip_id, toString(pickup_datetime), toString(dropoff_datetime))) AS ts
+      FROM nyc.trips
+    expect: |
+      SELECT count() AS rows, sum(fare_amount) AS fares, sum(tip_amount) AS tips,
+             uniqExact(trip_id) AS ids, countIf(pickup_borough = 'Staten Island') AS si,
+             groupBitXor(cityHash64(trip_id, toString(pickup_datetime), toString(dropoff_datetime))) AS ts
+      FROM file('trips.csv', 'CSVWithNames',
+           'trip_id UInt32, pickup_datetime DateTime, dropoff_datetime DateTime, pickup_borough String,
+            passenger_count UInt8, trip_distance Float64, fare_amount Decimal(9, 2), payment_type String,
+            tip_amount Decimal(9, 2)')
+    hint: Load the whole file once. Loading it twice doubles the counts; drop and recreate, or TRUNCATE, before retrying.
+
+solution: |
+  -- Look before you load: what did schema inference find?
+  DESCRIBE file('trips.csv', 'CSVWithNames');
+  SELECT * FROM file('trips.csv', 'CSVWithNames') LIMIT 3;
+
+  CREATE DATABASE nyc;
+
+  CREATE TABLE nyc.trips
+  (
+      trip_id          UInt32,
+      pickup_datetime  DateTime,
+      dropoff_datetime DateTime,
+      pickup_borough   LowCardinality(String),
+      passenger_count  UInt8,
+      trip_distance    Float32,
+      fare_amount      Decimal32(2),
+      payment_type     LowCardinality(String),
+      tip_amount       Decimal32(2)
+  )
+  ENGINE = MergeTree
+  ORDER BY (pickup_borough, pickup_datetime);
+
+  -- In clickhouse-client, FROM INFILE reads a file on the client's machine.
+  INSERT INTO nyc.trips FROM INFILE '/data/trips.csv' FORMAT CSVWithNames;
+
+wrong_solutions:
+  - name: inferred types, everything Nullable
+    must_fail:
+      - Columns match the file, and none is Nullable
+      - Efficient data types for every column
+    sql: |
+      CREATE DATABASE nyc;
+      CREATE TABLE nyc.trips ENGINE = MergeTree ORDER BY tuple()
+      AS SELECT * FROM file('trips.csv', 'CSVWithNames');
+  - name: date first in the key
+    must_fail:
+      - Primary key starts with pickup_borough, then pickup_datetime
+    sql: |
+      CREATE DATABASE nyc;
+      CREATE TABLE nyc.trips (trip_id UInt32, pickup_datetime DateTime, dropoff_datetime DateTime,
+        pickup_borough LowCardinality(String), passenger_count UInt8, trip_distance Float32,
+        fare_amount Decimal32(2), payment_type LowCardinality(String), tip_amount Decimal32(2))
+      ENGINE = MergeTree ORDER BY (pickup_datetime, pickup_borough);
+      INSERT INTO nyc.trips FROM INFILE '/data/trips.csv' FORMAT CSVWithNames;
+  - name: borough-only key, file loaded twice
+    must_fail:
+      - A typical query skips at least 90% of granules
+      - All 500,000 rows loaded, exactly as in the file
+    sql: |
+      CREATE DATABASE nyc;
+      CREATE TABLE nyc.trips (trip_id UInt32, pickup_datetime DateTime, dropoff_datetime DateTime,
+        pickup_borough LowCardinality(String), passenger_count UInt8, trip_distance Float32,
+        fare_amount Decimal32(2), payment_type LowCardinality(String), tip_amount Decimal32(2))
+      ENGINE = MergeTree ORDER BY (pickup_borough);
+      INSERT INTO nyc.trips FROM INFILE '/data/trips.csv' FORMAT CSVWithNames;
+      INSERT INTO nyc.trips FROM INFILE '/data/trips.csv' FORMAT CSVWithNames;
+
+alternatives:
+  - name: Enum8 strings, Decimal(5,2), toDate in the key, INSERT SELECT from file()
+    sql: |
+      CREATE DATABASE nyc;
+      CREATE TABLE nyc.trips (
+        trip_id UInt32, pickup_datetime DateTime('UTC'), dropoff_datetime DateTime('UTC'),
+        pickup_borough Enum8('Manhattan' = 1, 'Brooklyn' = 2, 'Queens' = 3, 'Bronx' = 4, 'EWR' = 5, 'Staten Island' = 6),
+        passenger_count UInt8, trip_distance Decimal(5, 2), fare_amount Decimal(7, 2),
+        payment_type Enum8('Card' = 1, 'Cash' = 2, 'No Charge' = 3, 'Dispute' = 4), tip_amount Decimal(7, 2))
+      ENGINE = MergeTree PRIMARY KEY (pickup_borough, toDate(pickup_datetime))
+      ORDER BY (pickup_borough, toDate(pickup_datetime), pickup_datetime);
+      INSERT INTO nyc.trips SELECT * FROM file('trips.csv', 'CSVWithNames');

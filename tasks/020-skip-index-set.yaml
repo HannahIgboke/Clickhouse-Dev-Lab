@@ -1,0 +1,106 @@
+id: 20
+slug: skip-index-set
+title: A set skipping index for rare values
+domains: [optimizing]
+objectives: [O4]
+tier: 2
+minutes: 10
+docs:
+  - https://clickhouse.com/docs/optimize/skipping-indexes
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree#table_engine-mergetree-data_skipping-indexes
+  - https://clickhouse.com/docs/sql-reference/statements/alter/skipping-index
+
+brief: |
+  support.tickets is sorted by created_at. Its priority column holds 'P1' to
+  'P4'. P1 tickets are rare and arrive in bursts during incidents, so most
+  granules contain no P1 ticket at all.
+
+  This query scans every granule:
+
+    SELECT count() FROM support.tickets WHERE priority = 'P1'
+
+  1. Add a set skipping index named idx_priority on priority. Choose a set
+  size that fits the number of distinct values.
+
+  2. Build it for the existing data, so the query above reads at most 10% of
+  the table's granules.
+
+reset:
+  - DROP DATABASE IF EXISTS support SYNC
+
+setup:
+  - CREATE DATABASE support
+  - |
+    CREATE TABLE support.tickets
+    (
+        ticket_id  UInt64,
+        created_at DateTime,
+        priority   LowCardinality(String),
+        team       LowCardinality(String),
+        subject    String
+    )
+    ENGINE = MergeTree ORDER BY created_at
+  - |
+    INSERT INTO support.tickets
+    SELECT number + 1, ts,
+           if(toDayOfYear(ts) % 40 = 7 AND toHour(ts) BETWEEN 9 AND 12 AND cityHash64(number, {seed}, 2) % 3 = 0, 'P1',
+              ['P2', 'P3', 'P3', 'P4'][1 + (cityHash64(number, {seed}, 3) % 4)]),
+           ['billing', 'auth', 'mobile', 'web'][1 + (cityHash64(number, {seed}, 4) % 4)],
+           concat('Ticket ', toString(number))
+    FROM (SELECT number, toDateTime('2025-01-01 00:00:00') + intDiv(number * 31536000, 2000000) AS ts FROM numbers(2000000))
+
+checks:
+  - name: idx_priority is a set index on priority
+    type: sql_true
+    points: 30
+    query: |
+      SELECT type = 'set' AND expr = 'priority'
+      FROM system.data_skipping_indices WHERE database = 'support' AND table = 'tickets' AND name = 'idx_priority'
+    show: |
+      SELECT concat(name, ' ', type_full, ' on ', expr) FROM system.data_skipping_indices WHERE database = 'support' AND table = 'tickets'
+    hint: ALTER TABLE support.tickets ADD INDEX idx_priority priority TYPE set(4) GRANULARITY 1
+
+  - name: The P1 query reads at most 10% of granules
+    type: granules
+    stage: final
+    points: 50
+    max_ratio: 0.10
+    query: SELECT count() FROM support.tickets WHERE priority = 'P1'
+    hint: >-
+      An index added with ALTER only covers new parts. Run ALTER TABLE ... MATERIALIZE INDEX idx_priority.
+      Too small a set size (set(1)) cannot describe a granule holding two values, so it skips nothing.
+
+  - name: Index added, table data and sort order unchanged
+    type: sql_true
+    points: 20
+    query: |
+      SELECT (SELECT count() FROM support.tickets) = 2000000
+         AND (SELECT sorting_key FROM system.tables WHERE database = 'support' AND name = 'tickets') = 'created_at'
+         AND (SELECT count() FROM system.data_skipping_indices WHERE database = 'support' AND table = 'tickets') > 0
+
+solution: |
+  SELECT priority, count() FROM support.tickets GROUP BY priority;
+
+  ALTER TABLE support.tickets ADD INDEX idx_priority priority TYPE set(4) GRANULARITY 1;
+  ALTER TABLE support.tickets MATERIALIZE INDEX idx_priority SETTINGS mutations_sync = 1;
+
+  EXPLAIN indexes = 1 SELECT count() FROM support.tickets WHERE priority = 'P1';
+
+alternatives:
+  - name: set(10), granularity 2
+    sql: |
+      ALTER TABLE support.tickets ADD INDEX idx_priority priority TYPE set(10) GRANULARITY 2;
+      ALTER TABLE support.tickets MATERIALIZE INDEX idx_priority SETTINGS mutations_sync = 1;
+
+wrong_solutions:
+  - name: index never materialized
+    must_fail:
+      - The P1 query reads at most 10% of granules
+    sql: |
+      ALTER TABLE support.tickets ADD INDEX idx_priority priority TYPE set(4) GRANULARITY 1;
+  - name: minmax instead of set
+    must_fail:
+      - idx_priority is a set index on priority
+    sql: |
+      ALTER TABLE support.tickets ADD INDEX idx_priority priority TYPE minmax GRANULARITY 1;
+      ALTER TABLE support.tickets MATERIALIZE INDEX idx_priority SETTINGS mutations_sync = 1;

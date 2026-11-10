@@ -1,0 +1,155 @@
+id: 17
+slug: mv-summing
+title: Daily counters with SummingMergeTree
+domains: [optimizing, analyzing]
+objectives: [O2, A3, A4]
+tier: 2
+minutes: 14
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/summingmergetree
+  - https://clickhouse.com/docs/materialized-view/incremental-materialized-view
+
+brief: |
+  traffic.pageviews gets one row per page view (ts, page, country, user_id).
+
+  1. Create traffic.daily_views using the SummingMergeTree engine with the
+  columns day Date, page LowCardinality(String), views UInt64, sorted by day
+  then page.
+
+  2. Create a materialized view traffic.daily_views_mv TO
+  traffic.daily_views that counts views per day and page as data arrives.
+  Make sure the page views already in traffic.pageviews are counted too.
+
+  3. Create a view answers.top_pages_june that reads traffic.daily_views (not
+  traffic.pageviews) and returns the 10 pages with the most views in June 2025,
+  columns page and views, most first. It must be correct even when parts have
+  not been merged yet.
+
+reset:
+  - DROP DATABASE IF EXISTS traffic SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.top_pages_june SYNC
+
+setup:
+  - CREATE DATABASE traffic
+  - |
+    CREATE TABLE traffic.pageviews (ts DateTime, page LowCardinality(String), country LowCardinality(String), user_id UInt64)
+    ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO traffic.pageviews
+    SELECT toDateTime('2025-05-01 00:00:00') + (cityHash64(number, {seed}, 1) % (92 * 86400)),
+           concat('/p/', toString(cityHash64(number, {seed}, 2) % 60)),
+           ['NG', 'GH', 'US', 'GB', 'IN'][1 + (cityHash64(number, {seed}, 3) % 5)],
+           cityHash64(number, {seed}, 4) % 50000
+    FROM numbers(1000000)
+
+checks:
+  - name: traffic.daily_views is SummingMergeTree sorted by (day, page)
+    type: sql_true
+    points: 15
+    query: |
+      SELECT engine = 'SummingMergeTree' AND sorting_key = 'day, page'
+      FROM system.tables WHERE database = 'traffic' AND name = 'daily_views'
+    show: SELECT concat(engine, ' ORDER BY ', sorting_key) FROM system.tables WHERE database = 'traffic' AND name = 'daily_views'
+
+  - name: traffic.daily_views_mv writes TO traffic.daily_views
+    type: sql_true
+    points: 10
+    query: |
+      SELECT engine = 'MaterializedView' AND match(create_table_query, 'TO traffic\\.daily_views\\b')
+      FROM system.tables WHERE database = 'traffic' AND name = 'daily_views_mv'
+
+  - name: Historical page views counted (backfill)
+    type: result
+    points: 25
+    query: |
+      SELECT sum(views) AS views, groupBitXor(cityHash64(day, toString(page), v)) AS fp
+      FROM (SELECT day, page, sum(views) AS v, v AS views FROM traffic.daily_views WHERE page NOT LIKE '/chlab-probe%' GROUP BY day, page)
+    expect: |
+      SELECT sum(c) AS views, groupBitXor(cityHash64(day, toString(page), c)) AS fp
+      FROM (SELECT toDate(ts) AS day, page, count() AS c FROM traffic.pageviews WHERE page NOT LIKE '/chlab-probe%' GROUP BY day, page)
+    hint: Backfill once with INSERT INTO traffic.daily_views SELECT toDate(ts), page, count() FROM traffic.pageviews GROUP BY 1, 2.
+
+  - name: New views are counted, across separate inserts
+    type: sql_true
+    points: 20
+    prepare:
+      - INSERT INTO traffic.pageviews SELECT toDateTime('2025-06-10 10:00:00'), '/chlab-probe', 'NG', number FROM numbers(3)
+      - INSERT INTO traffic.pageviews SELECT toDateTime('2025-06-10 11:00:00'), '/chlab-probe', 'GH', number FROM numbers(4)
+    query: SELECT sum(views) = 7 FROM traffic.daily_views WHERE page = '/chlab-probe'
+    show: SELECT sum(views) FROM traffic.daily_views WHERE page = '/chlab-probe'
+    cleanup:
+      - DELETE FROM traffic.daily_views WHERE page = '/chlab-probe'
+      - DELETE FROM traffic.pageviews WHERE page = '/chlab-probe'
+
+  - name: answers.top_pages_june is right on unmerged data
+    type: result
+    points: 30
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.dv AS traffic.daily_views
+      - SYSTEM STOP MERGES chlab_grader.dv
+      - INSERT INTO chlab_grader.dv SELECT toDate(ts), page, count() FROM traffic.pageviews WHERE country IN ('NG', 'GH') GROUP BY 1, 2
+      - INSERT INTO chlab_grader.dv SELECT toDate(ts), page, count() FROM traffic.pageviews WHERE country IN ('US', 'GB') GROUP BY 1, 2
+      - INSERT INTO chlab_grader.dv SELECT toDate(ts), page, count() FROM traffic.pageviews WHERE country = 'IN' GROUP BY 1, 2
+    query: SELECT toString(page) AS page, views FROM {as_select:answers.top_pages_june|traffic.daily_views=>chlab_grader.dv}
+    expect: |
+      SELECT toString(page) AS page, count() AS views FROM traffic.pageviews
+      WHERE ts >= '2025-06-01 00:00:00' AND ts < '2025-07-01 00:00:00'
+      GROUP BY page ORDER BY views DESC, page LIMIT 10
+    ordered: false
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: >-
+      SummingMergeTree only sums rows when parts merge. Queries must still aggregate:
+      SELECT page, sum(views) AS views ... GROUP BY page.
+
+solution: |
+  CREATE TABLE traffic.daily_views
+  (
+      day   Date,
+      page  LowCardinality(String),
+      views UInt64
+  )
+  ENGINE = SummingMergeTree
+  ORDER BY (day, page);
+
+  CREATE MATERIALIZED VIEW traffic.daily_views_mv TO traffic.daily_views AS
+  SELECT toDate(ts) AS day, page, count() AS views
+  FROM traffic.pageviews
+  GROUP BY day, page;
+
+  INSERT INTO traffic.daily_views
+  SELECT toDate(ts) AS day, page, count() AS views FROM traffic.pageviews GROUP BY day, page;
+
+  CREATE VIEW answers.top_pages_june AS
+  SELECT page, sum(views) AS views
+  FROM traffic.daily_views
+  WHERE day >= '2025-06-01' AND day < '2025-07-01'
+  GROUP BY page
+  ORDER BY views DESC
+  LIMIT 10;
+
+wrong_solutions:
+  - name: view relies on merges having happened
+    must_fail:
+      - answers.top_pages_june is right on unmerged data
+    sql: |
+      CREATE TABLE traffic.daily_views (day Date, page LowCardinality(String), views UInt64)
+      ENGINE = SummingMergeTree ORDER BY (day, page);
+      CREATE MATERIALIZED VIEW traffic.daily_views_mv TO traffic.daily_views AS
+      SELECT toDate(ts) AS day, page, count() AS views FROM traffic.pageviews GROUP BY day, page;
+      INSERT INTO traffic.daily_views SELECT toDate(ts), page, count() FROM traffic.pageviews GROUP BY 1, 2;
+      CREATE VIEW answers.top_pages_june AS
+      SELECT page, views FROM traffic.daily_views WHERE toYYYYMM(day) = 202506 ORDER BY views DESC LIMIT 10;
+  - name: plain MergeTree target
+    must_fail:
+      - traffic.daily_views is SummingMergeTree sorted by (day, page)
+    sql: |
+      CREATE TABLE traffic.daily_views (day Date, page LowCardinality(String), views UInt64)
+      ENGINE = MergeTree ORDER BY (day, page);
+      CREATE MATERIALIZED VIEW traffic.daily_views_mv TO traffic.daily_views AS
+      SELECT toDate(ts) AS day, page, count() AS views FROM traffic.pageviews GROUP BY day, page;
+      INSERT INTO traffic.daily_views SELECT toDate(ts), page, count() FROM traffic.pageviews GROUP BY 1, 2;
+      CREATE VIEW answers.top_pages_june AS
+      SELECT page, sum(views) AS views FROM traffic.daily_views WHERE toYYYYMM(day) = 202506 GROUP BY page ORDER BY views DESC LIMIT 10;

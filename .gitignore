@@ -1,0 +1,7 @@
+workspace/data/*
+!workspace/data/.gitkeep
+.chlab/
+__pycache__/
+*.egg-info/
+.venv/
+venv/

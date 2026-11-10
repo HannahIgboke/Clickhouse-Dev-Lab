@@ -1,0 +1,128 @@
+id: 27
+slug: category-leaders
+title: Best seller per category with argMax
+domains: [analyzing]
+objectives: [A1, A3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/argmax
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/uniqexact
+
+brief: |
+  market.order_items has one row per order line: order_id, ts, customer_id,
+  category, product, qty and unit_price.
+
+  Create a view answers.category_leaders with one row per category, ordered
+  by category, with the columns:
+
+    category          the category
+    top_product       the product with the highest revenue (qty * unit_price)
+                      in that category
+    top_revenue       that product's revenue
+    category_revenue  the category's total revenue
+    customers         the exact number of distinct customers who bought in
+                      that category
+
+reset:
+  - DROP DATABASE IF EXISTS market SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.category_leaders SYNC
+
+setup:
+  - CREATE DATABASE market
+  - |
+    CREATE TABLE market.order_items
+    (
+        order_id UInt64, ts DateTime, customer_id UInt32, category LowCardinality(String),
+        product String, qty UInt16, unit_price Decimal(10, 2)
+    )
+    ENGINE = MergeTree ORDER BY (category, ts)
+  - |
+    INSERT INTO market.order_items
+    SELECT intDiv(number, 3) + 1,
+           toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 1) % (180 * 86400)),
+           toUInt32(1 + cityHash64(number, {seed}, 2) % 2000000),
+           cat,
+           concat(cat, '-', toString(p)),
+           toUInt16(1 + cityHash64(number, {seed}, 4) % 5),
+           toDecimal64(round(2 + (cityHash64(p, cat, {seed}) % 30000) / 100, 2), 2)
+    FROM (SELECT number, ['books', 'garden', 'kitchen', 'toys', 'audio', 'sports'][1 + (cityHash64(number, {seed}, 5) % 6)] AS cat,
+                 cityHash64(number, {seed}, 3) % 120 AS p FROM numbers(600000))
+
+checks:
+  - name: answers.category_leaders has the five columns
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['category', 'top_product', 'top_revenue', 'category_revenue', 'customers']
+      FROM (SELECT name FROM system.columns WHERE database = 'answers' AND table = 'category_leaders' ORDER BY position)
+    show: SELECT name FROM system.columns WHERE database = 'answers' AND table = 'category_leaders' ORDER BY position
+
+  - name: Top product and its revenue per category
+    type: result
+    points: 45
+    tolerance: 0.0000001
+    query: SELECT toString(category) AS c, top_product, toFloat64(top_revenue) AS r FROM answers.category_leaders
+    expect: |
+      SELECT toString(category) AS c, argMax(product, rev) AS top_product, toFloat64(max(rev)) AS r
+      FROM (SELECT category, product, sum(qty * unit_price) AS rev FROM market.order_items GROUP BY category, product)
+      GROUP BY category ORDER BY category
+    hint: Aggregate per (category, product) first, then argMax(product, revenue) per category.
+
+  - name: Category revenue and exact distinct customers
+    type: result
+    points: 45
+    tolerance: 0.0000001
+    query: SELECT toString(category) AS c, toFloat64(category_revenue) AS r, toUInt64(customers) AS u FROM answers.category_leaders
+    expect: |
+      SELECT toString(category) AS c, toFloat64(sum(qty * unit_price)) AS r, uniqExact(customer_id) AS u
+      FROM market.order_items GROUP BY category ORDER BY category
+    hint: uniq() is approximate; the task asks for exact counts (uniqExact or count(DISTINCT ...)).
+
+solution: |
+  CREATE VIEW answers.category_leaders AS
+  SELECT
+      p.category                       AS category,
+      argMax(p.product, p.revenue)     AS top_product,
+      max(p.revenue)                   AS top_revenue,
+      sum(p.revenue)                   AS category_revenue,
+      any(c.customers)                 AS customers
+  FROM
+  (
+      SELECT category, product, sum(qty * unit_price) AS revenue
+      FROM market.order_items
+      GROUP BY category, product
+  ) AS p
+  INNER JOIN
+  (
+      SELECT category, uniqExact(customer_id) AS customers
+      FROM market.order_items
+      GROUP BY category
+  ) AS c ON p.category = c.category
+  GROUP BY p.category
+  ORDER BY category;
+
+alternatives:
+  - name: window function and count(DISTINCT)
+    sql: |
+      CREATE VIEW answers.category_leaders AS
+      SELECT category, top_product, top_revenue, category_revenue, customers FROM (
+        SELECT category, product AS top_product, rev AS top_revenue,
+               sum(rev) OVER (PARTITION BY category) AS category_revenue,
+               row_number() OVER (PARTITION BY category ORDER BY rev DESC) AS rn
+        FROM (SELECT category, product, sum(qty * unit_price) AS rev FROM market.order_items GROUP BY category, product)
+      ) AS t
+      INNER JOIN (SELECT category, count(DISTINCT customer_id) AS customers FROM market.order_items GROUP BY category) AS u USING (category)
+      WHERE rn = 1 ORDER BY category;
+
+wrong_solutions:
+  - name: argMax over single lines, approximate uniq
+    must_fail:
+      - Top product and its revenue per category
+      - Category revenue and exact distinct customers
+    sql: |
+      CREATE VIEW answers.category_leaders AS
+      SELECT category, argMax(product, qty * unit_price) AS top_product, max(qty * unit_price) AS top_revenue,
+             sum(qty * unit_price) AS category_revenue, uniq(customer_id) AS customers
+      FROM market.order_items GROUP BY category ORDER BY category;

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "clickhouse-dev-lab"
+version = "1.0.0"
+description = "Hands-on ClickHouse certification practice — 36 auto-graded tasks, real clickhouse-client"
+authors = [{name = "Hannah Igboke", email = "danielhannah663@gmail.com"}]
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = ["click>=8", "pyyaml>=6", "docker>=7", "watchdog>=4"]
+
+[project.scripts]
+chlab = "chlab.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["chlab*"]
+
+[tool.setuptools.package-data]
+"chlab" = ["tasks/*.yaml", "tasks/*.json"]

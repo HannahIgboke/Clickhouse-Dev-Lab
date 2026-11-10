@@ -1,0 +1,235 @@
+id: 3
+slug: crm-upserts
+title: Upserts with ReplacingMergeTree
+domains: [dedup, inserting]
+objectives: [D2, I5, A1]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
+  - https://clickhouse.com/docs/guides/replacing-merge-tree
+  - https://clickhouse.com/docs/sql-reference/statements/select/from#final-modifier
+
+brief: |
+  The table crm.customers_raw is a change feed from the CRM: every time a
+  customer record changes, the full new row is appended with a new
+  updated_at. A customer can therefore appear several times, and rows do not
+  arrive in time order.
+
+  1. Create a table crm.customers with the same columns as crm.customers_raw,
+  designed so that each customer_id ends up as a single row: the row with the
+  latest updated_at, whatever order the rows were inserted in. Use the
+  ReplacingMergeTree engine.
+
+  2. Load every row of crm.customers_raw into crm.customers.
+
+  3. Create a view answers.gold_customers that returns a single row with a
+  single column named gold: the number of customers whose current tier is
+  'gold'. The view must return the right number even when newly inserted rows
+  have not been merged yet. Do not rely on OPTIMIZE having run.
+
+reset:
+  - DROP DATABASE IF EXISTS crm SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.gold_customers SYNC
+
+setup:
+  - CREATE DATABASE crm
+  - |
+    CREATE TABLE crm.customers_raw
+    (
+        customer_id UInt32,
+        name        String,
+        email       String,
+        tier        LowCardinality(String),
+        city        LowCardinality(String),
+        updated_at  DateTime
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+  - |
+    INSERT INTO crm.customers_raw
+    SELECT
+        customer_id,
+        concat(['Ada', 'Chidi', 'Emeka', 'Fatima', 'Grace', 'Ifeoma', 'Kofi', 'Lena', 'Musa', 'Tobi'][1 + (cityHash64(customer_id, {seed}, 1) % 10)],
+               ' ', ['Okafor', 'Bello', 'Smith', 'Mensah', 'Adeyemi', 'Garcia', 'Nwosu', 'Kim'][1 + (cityHash64(customer_id, {seed}, 2) % 8)]) AS name,
+        concat('user', toString(customer_id), '.v', toString(v), '@example.com') AS email,
+        ['bronze', 'bronze', 'silver', 'silver', 'gold'][1 + (cityHash64(customer_id, v, {seed}, 3) % 5)] AS tier,
+        ['Lagos', 'Abuja', 'Accra', 'Nairobi', 'London', 'Berlin'][1 + (cityHash64(customer_id, v, {seed}, 4) % 6)] AS city,
+        toDateTime('2024-01-01 00:00:00') + v * 30 * 86400 + (cityHash64(customer_id, v, {seed}, 5) % (29 * 86400)) AS updated_at
+    FROM
+    (
+        SELECT toUInt32(number + 1) AS customer_id,
+               arrayJoin(range(1 + (cityHash64(number, {seed}) % 5))) AS v
+        FROM numbers(20000)
+    )
+    ORDER BY cityHash64(customer_id, v, {seed}, 9)
+
+checks:
+  - name: crm.customers uses ReplacingMergeTree
+    type: sql_true
+    points: 10
+    query: SELECT engine = 'ReplacingMergeTree' FROM system.tables WHERE database = 'crm' AND name = 'customers'
+    show: SELECT engine FROM system.tables WHERE database = 'crm' AND name = 'customers'
+
+  - name: updated_at is the version column
+    type: sql_true
+    points: 15
+    query: |
+      SELECT match(engine_full, '^ReplacingMergeTree\\(updated_at[,)]')
+      FROM system.tables WHERE database = 'crm' AND name = 'customers'
+    show: |
+      SELECT extract(engine_full, '^ReplacingMergeTree\\([^)]*\\)')
+      FROM system.tables WHERE database = 'crm' AND name = 'customers'
+    hint: >-
+      Without a version column, ReplacingMergeTree keeps the last row inserted, not the newest.
+      ENGINE = ReplacingMergeTree(updated_at).
+
+  - name: ORDER BY is exactly customer_id (the deduplication key)
+    type: sql_true
+    points: 15
+    query: SELECT sorting_key = 'customer_id' FROM system.tables WHERE database = 'crm' AND name = 'customers'
+    show: SELECT sorting_key FROM system.tables WHERE database = 'crm' AND name = 'customers'
+    hint: >-
+      ReplacingMergeTree removes rows that share the same ORDER BY value. Adding updated_at
+      to the ORDER BY makes every version unique, so nothing is ever replaced.
+
+  - name: Every customer present once, with its latest values
+    type: result
+    points: 15
+    query: |
+      SELECT count() AS customers, groupBitXor(cityHash64(customer_id, email, tier, city)) AS fingerprint
+      FROM crm.customers FINAL
+    expect: |
+      SELECT count() AS customers, groupBitXor(cityHash64(customer_id, email, tier, city)) AS fingerprint
+      FROM (SELECT customer_id, argMax(email, updated_at) AS email, argMax(tier, updated_at) AS tier,
+                   argMax(city, updated_at) AS city
+            FROM crm.customers_raw GROUP BY customer_id)
+    hint: Load with INSERT INTO crm.customers SELECT * FROM crm.customers_raw.
+
+  - name: Newest version wins even when it arrives first
+    type: sql_true
+    points: 15
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.customers AS crm.customers
+      - SYSTEM STOP MERGES chlab_grader.customers
+      - INSERT INTO chlab_grader.customers (customer_id, tier, updated_at) VALUES (999999, 'gold', '2026-06-01 00:00:00')
+      - INSERT INTO chlab_grader.customers (customer_id, tier, updated_at) VALUES (999999, 'silver', '2026-01-01 00:00:00')
+    query: SELECT groupArray(tier) = ['gold'] FROM chlab_grader.customers FINAL WHERE customer_id = 999999
+    show: SELECT tier FROM chlab_grader.customers FINAL WHERE customer_id = 999999
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: >-
+      The grader inserted a newer 'gold' row, then an older 'silver' row for the same customer
+      into a copy of your table. Only a version column makes the newer one win.
+
+  - name: answers.gold_customers is a view returning one column, gold
+    type: sql_true
+    points: 5
+    query: |
+      SELECT (SELECT engine FROM system.tables WHERE database = 'answers' AND name = 'gold_customers') = 'View'
+         AND (SELECT groupArray(name) FROM system.columns WHERE database = 'answers' AND table = 'gold_customers') = ['gold']
+    show: |
+      SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'answers' AND table = 'gold_customers'
+
+  - name: The view returns the correct gold count
+    type: result
+    points: 10
+    query: SELECT * FROM answers.gold_customers
+    expect: |
+      SELECT countIf(tier = 'gold') AS gold
+      FROM (SELECT argMax(tier, updated_at) AS tier FROM crm.customers_raw GROUP BY customer_id)
+
+  - name: The view is still correct before merges have happened
+    type: result
+    points: 15
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.unmerged AS crm.customers
+      - SYSTEM STOP MERGES chlab_grader.unmerged
+      - INSERT INTO chlab_grader.unmerged SELECT * FROM crm.customers_raw WHERE toMonth(updated_at) % 3 = 0
+      - INSERT INTO chlab_grader.unmerged SELECT * FROM crm.customers_raw WHERE toMonth(updated_at) % 3 = 1
+      - INSERT INTO chlab_grader.unmerged SELECT * FROM crm.customers_raw WHERE toMonth(updated_at) % 3 = 2
+    query: SELECT * FROM {as_select:answers.gold_customers|crm.customers=>chlab_grader.unmerged}
+    expect: |
+      SELECT countIf(tier = 'gold') AS gold
+      FROM (SELECT argMax(tier, updated_at) AS tier FROM crm.customers_raw GROUP BY customer_id)
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: >-
+      The grader ran your view's query against a copy of crm.customers loaded in three separate
+      inserts with merges stopped, so old versions were still present. Use FINAL, or
+      aggregate with argMax(tier, updated_at) per customer_id.
+
+solution: |
+  SHOW CREATE TABLE crm.customers_raw;
+
+  CREATE TABLE crm.customers
+  (
+      customer_id UInt32,
+      name        String,
+      email       String,
+      tier        LowCardinality(String),
+      city        LowCardinality(String),
+      updated_at  DateTime
+  )
+  ENGINE = ReplacingMergeTree(updated_at)
+  ORDER BY customer_id;
+
+  INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+
+  CREATE VIEW answers.gold_customers AS
+  SELECT countIf(tier = 'gold') AS gold
+  FROM crm.customers FINAL;
+
+  SELECT * FROM answers.gold_customers;
+
+alternatives:
+  - name: argMax view, CREATE ... AS with engine override
+    sql: |
+      CREATE TABLE crm.customers AS crm.customers_raw
+      ENGINE = ReplacingMergeTree(updated_at) ORDER BY (customer_id);
+      INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+      CREATE VIEW answers.gold_customers AS
+      SELECT count() AS gold FROM (
+        SELECT customer_id, argMax(tier, updated_at) AS current_tier
+        FROM crm.customers GROUP BY customer_id)
+      WHERE current_tier = 'gold';
+  - name: LIMIT 1 BY view
+    sql: |
+      CREATE TABLE crm.customers AS crm.customers_raw
+      ENGINE = ReplacingMergeTree(updated_at) ORDER BY customer_id;
+      INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+      CREATE VIEW answers.gold_customers AS
+      SELECT countIf(tier = 'gold') AS gold FROM (
+        SELECT customer_id, tier FROM crm.customers
+        ORDER BY customer_id, updated_at DESC LIMIT 1 BY customer_id);
+
+wrong_solutions:
+  - name: no version column
+    must_fail:
+      - updated_at is the version column
+      - Newest version wins even when it arrives first
+    sql: |
+      CREATE TABLE crm.customers AS crm.customers_raw ENGINE = ReplacingMergeTree ORDER BY customer_id;
+      INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+      CREATE VIEW answers.gold_customers AS SELECT countIf(tier = 'gold') AS gold FROM crm.customers FINAL;
+  - name: updated_at in the ORDER BY
+    must_fail:
+      - ORDER BY is exactly customer_id (the deduplication key)
+      - Every customer present once, with its latest values
+      - The view returns the correct gold count
+    sql: |
+      CREATE TABLE crm.customers AS crm.customers_raw
+      ENGINE = ReplacingMergeTree(updated_at) ORDER BY (customer_id, updated_at);
+      INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+      CREATE VIEW answers.gold_customers AS SELECT countIf(tier = 'gold') AS gold FROM crm.customers FINAL;
+  - name: view without FINAL
+    must_fail:
+      - The view is still correct before merges have happened
+    sql: |
+      CREATE TABLE crm.customers AS crm.customers_raw
+      ENGINE = ReplacingMergeTree(updated_at) ORDER BY customer_id;
+      INSERT INTO crm.customers SELECT * FROM crm.customers_raw;
+      CREATE VIEW answers.gold_customers AS SELECT countIf(tier = 'gold') AS gold FROM crm.customers;

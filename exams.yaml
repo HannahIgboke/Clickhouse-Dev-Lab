@@ -1,0 +1,11 @@
+# Fixed mock exams: `chlab exam --set 1`. Each has 11 tasks shaped like the real exam
+# (2 tier-1, 6 tier-2, 3 tier-3/4), covering all five domains, with a 120-minute clock.
+# `chlab exam` without --set draws a fresh random exam with the same shape.
+
+exams:
+  - id: 1
+    tasks: [4, 6, 1, 8, 13, 16, 19, 26, 3, 10, 18]
+  - id: 2
+    tasks: [5, 7, 2, 9, 12, 17, 20, 22, 14, 23, 25]
+  - id: 3
+    tasks: [4, 7, 1, 11, 13, 21, 22, 27, 15, 24, 29]

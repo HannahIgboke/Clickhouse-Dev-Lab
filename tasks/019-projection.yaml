@@ -1,0 +1,100 @@
+id: 19
+slug: projection
+title: Speed up lookups by customer with a projection
+domains: [optimizing]
+objectives: [O3]
+tier: 2
+minutes: 10
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/alter/projection
+  - https://clickhouse.com/docs/data-modeling/projections
+
+brief: |
+  shop_orders.orders is sorted by ts, which suits the reporting queries. The
+  support team now also runs many lookups like:
+
+    SELECT * FROM shop_orders.orders WHERE customer_id = 1234
+
+  These scan the whole table. Without changing the table's ORDER BY:
+
+  1. Add a projection named by_customer that keeps all columns sorted by
+  customer_id.
+
+  2. Make sure the projection is built for the data that is already in the
+  table, so lookups by customer_id use it immediately.
+
+reset:
+  - DROP DATABASE IF EXISTS shop_orders SYNC
+
+setup:
+  - CREATE DATABASE shop_orders
+  - |
+    CREATE TABLE shop_orders.orders
+    (
+        order_id    UInt64,
+        customer_id UInt32,
+        ts          DateTime,
+        amount      Decimal(10, 2),
+        status      LowCardinality(String)
+    )
+    ENGINE = MergeTree ORDER BY ts
+  - |
+    INSERT INTO shop_orders.orders
+    SELECT number + 1, toUInt32(1 + cityHash64(number, {seed}, 1) % 100000),
+           toDateTime('2025-01-01 00:00:00') + (cityHash64(number, {seed}, 2) % (300 * 86400)),
+           toDecimal64(round((cityHash64(number, {seed}, 3) % 50000) / 100, 2), 2),
+           ['paid', 'shipped', 'delivered', 'returned'][1 + (cityHash64(number, {seed}, 4) % 4)]
+    FROM numbers(2000000)
+
+checks:
+  - name: ORDER BY is still ts, with a projection added
+    type: sql_true
+    points: 10
+    query: |
+      SELECT sorting_key = 'ts' AND (SELECT count() FROM system.projections WHERE database = 'shop_orders' AND table = 'orders') > 0
+      FROM system.tables WHERE database = 'shop_orders' AND name = 'orders'
+
+  - name: Projection by_customer sorts by customer_id
+    type: sql_true
+    points: 25
+    query: |
+      SELECT count() = 1 FROM system.projections
+      WHERE database = 'shop_orders' AND table = 'orders' AND name = 'by_customer' AND sorting_key[1] = 'customer_id'
+    show: |
+      SELECT concat(name, ' ', toString(sorting_key)) FROM system.projections WHERE database = 'shop_orders' AND table = 'orders'
+    hint: ALTER TABLE shop_orders.orders ADD PROJECTION by_customer (SELECT * ORDER BY customer_id)
+
+  - name: Projection built for every existing part
+    type: sql_true
+    points: 30
+    query: |
+      SELECT (SELECT count() FROM system.parts WHERE database = 'shop_orders' AND table = 'orders' AND active)
+           = (SELECT count() FROM system.projection_parts WHERE database = 'shop_orders' AND table = 'orders' AND name = 'by_customer' AND active)
+    show: |
+      SELECT concat(toString((SELECT count() FROM system.projection_parts WHERE database = 'shop_orders' AND table = 'orders' AND name = 'by_customer' AND active)),
+                    ' of ', toString((SELECT count() FROM system.parts WHERE database = 'shop_orders' AND table = 'orders' AND active)), ' parts have it')
+    hint: A new projection only applies to new inserts. ALTER TABLE ... MATERIALIZE PROJECTION by_customer builds it for existing parts.
+
+  - name: Lookups by customer_id read the projection
+    type: explain_contains
+    points: 35
+    query: SELECT * FROM shop_orders.orders WHERE customer_id = 1234
+    text: ReadFromMergeTree (by_customer)
+
+solution: |
+  ALTER TABLE shop_orders.orders
+      ADD PROJECTION by_customer (SELECT * ORDER BY customer_id);
+
+  ALTER TABLE shop_orders.orders
+      MATERIALIZE PROJECTION by_customer
+      SETTINGS mutations_sync = 1;
+
+  EXPLAIN indexes = 1 SELECT * FROM shop_orders.orders WHERE customer_id = 1234;
+
+wrong_solutions:
+  - name: projection added but never materialized
+    must_fail:
+      - Projection built for every existing part
+      - Lookups by customer_id read the projection
+    sql: |
+      ALTER TABLE shop_orders.orders ADD PROJECTION by_customer (SELECT * ORDER BY customer_id);

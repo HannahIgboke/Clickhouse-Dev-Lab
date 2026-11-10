@@ -1,0 +1,139 @@
+id: 16
+slug: mv-errors
+title: A materialized view that routes error rows
+domains: [optimizing, inserting]
+objectives: [O1, I5, M2]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/materialized-view/incremental-materialized-view
+  - https://clickhouse.com/docs/sql-reference/statements/create/view#materialized-view
+
+brief: |
+  ops.requests receives every API request (ts, service, path, status,
+  latency_ms) and already holds a few days of data.
+
+  The on-call team wants a small table with server errors only.
+
+  1. Create ops.errors (MergeTree, sorted by service then ts) with the columns
+  ts DateTime, service LowCardinality(String), path String, status UInt16.
+
+  2. Create a materialized view ops.errors_mv that writes every row with
+  status 500 or higher, from now on, into ops.errors (TO ops.errors). It must
+  not aggregate.
+
+  3. ops.errors must also contain the server errors already in ops.requests.
+
+reset:
+  - DROP DATABASE IF EXISTS ops SYNC
+
+setup:
+  - CREATE DATABASE ops
+  - |
+    CREATE TABLE ops.requests
+    (
+        ts         DateTime,
+        service    LowCardinality(String),
+        path       String,
+        status     UInt16,
+        latency_ms UInt32
+    )
+    ENGINE = MergeTree ORDER BY (service, ts)
+  - |
+    INSERT INTO ops.requests
+    SELECT toDateTime('2025-09-01 00:00:00') + (cityHash64(number, {seed}, 1) % (5 * 86400)),
+           ['auth', 'billing', 'search', 'profile'][1 + (cityHash64(number, {seed}, 2) % 4)],
+           concat('/v1/', ['login', 'pay', 'q', 'me', 'refund'][1 + (cityHash64(number, {seed}, 3) % 5)]),
+           [200, 200, 200, 200, 201, 400, 404, 500, 502, 503][1 + (cityHash64(number, {seed}, 4) % 10)],
+           toUInt32(5 + cityHash64(number, {seed}, 5) % 900)
+    FROM numbers(500000)
+
+checks:
+  - name: ops.errors has the specified columns, sorted by (service, ts)
+    type: sql_true
+    points: 15
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'ops' AND table = 'errors' ORDER BY position))
+             = ['ts DateTime', 'service LowCardinality(String)', 'path String', 'status UInt16']
+         AND (SELECT engine = 'MergeTree' AND sorting_key = 'service, ts' FROM system.tables WHERE database = 'ops' AND name = 'errors')
+    show: SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'ops' AND table = 'errors' ORDER BY position
+
+  - name: ops.errors_mv is a materialized view writing TO ops.errors
+    type: sql_true
+    points: 20
+    query: |
+      SELECT engine = 'MaterializedView' AND match(create_table_query, 'TO ops\\.errors\\b') AND positionCaseInsensitive(as_select, 'GROUP BY') = 0
+      FROM system.tables WHERE database = 'ops' AND name = 'errors_mv'
+    show: SELECT create_table_query FROM system.tables WHERE database = 'ops' AND name = 'errors_mv'
+    hint: CREATE MATERIALIZED VIEW ops.errors_mv TO ops.errors AS SELECT ... FROM ops.requests WHERE status >= 500
+
+  - name: Existing server errors were backfilled
+    type: result
+    points: 30
+    query: |
+      SELECT count() AS rows, groupBitXor(cityHash64(ts, toString(service), path, status)) AS fp
+      FROM ops.errors WHERE path NOT LIKE '/chlab-probe%'
+    expect: |
+      SELECT count() AS rows, groupBitXor(cityHash64(ts, toString(service), path, status)) AS fp
+      FROM ops.requests WHERE status >= 500 AND path NOT LIKE '/chlab-probe%'
+    hint: >-
+      A materialized view only sees inserts made after it exists. Copy older rows once with
+      INSERT INTO ops.errors SELECT ... FROM ops.requests WHERE status >= 500.
+
+  - name: New inserts are routed (only 5xx rows)
+    type: sql_true
+    points: 35
+    prepare:
+      - |
+        INSERT INTO ops.requests VALUES
+          (now(), 'auth', '/chlab-probe-a', 503, 10), (now(), 'auth', '/chlab-probe-b', 200, 10),
+          (now(), 'billing', '/chlab-probe-c', 500, 10), (now(), 'search', '/chlab-probe-d', 499, 10)
+    query: |
+      SELECT arraySort(groupArray(path)) = ['/chlab-probe-a', '/chlab-probe-c']
+      FROM ops.errors WHERE path LIKE '/chlab-probe%'
+    show: SELECT concat(path, ' ', toString(status)) FROM ops.errors WHERE path LIKE '/chlab-probe%'
+    cleanup:
+      - DELETE FROM ops.errors WHERE path LIKE '/chlab-probe%'
+      - DELETE FROM ops.requests WHERE path LIKE '/chlab-probe%'
+    hint: The grader inserted four probe rows (503, 200, 500, 499); only 503 and 500 should arrive.
+
+solution: |
+  CREATE TABLE ops.errors
+  (
+      ts      DateTime,
+      service LowCardinality(String),
+      path    String,
+      status  UInt16
+  )
+  ENGINE = MergeTree
+  ORDER BY (service, ts);
+
+  CREATE MATERIALIZED VIEW ops.errors_mv TO ops.errors AS
+  SELECT ts, service, path, status
+  FROM ops.requests
+  WHERE status >= 500;
+
+  -- The view only sees new inserts: backfill what is already there.
+  INSERT INTO ops.errors
+  SELECT ts, service, path, status FROM ops.requests WHERE status >= 500;
+
+wrong_solutions:
+  - name: no backfill
+    must_fail:
+      - Existing server errors were backfilled
+    sql: |
+      CREATE TABLE ops.errors (ts DateTime, service LowCardinality(String), path String, status UInt16)
+      ENGINE = MergeTree ORDER BY (service, ts);
+      CREATE MATERIALIZED VIEW ops.errors_mv TO ops.errors AS
+      SELECT ts, service, path, status FROM ops.requests WHERE status >= 500;
+  - name: off-by-one filter
+    must_fail:
+      - New inserts are routed (only 5xx rows)
+      - Existing server errors were backfilled
+    sql: |
+      CREATE TABLE ops.errors (ts DateTime, service LowCardinality(String), path String, status UInt16)
+      ENGINE = MergeTree ORDER BY (service, ts);
+      CREATE MATERIALIZED VIEW ops.errors_mv TO ops.errors AS
+      SELECT ts, service, path, status FROM ops.requests WHERE status > 400;
+      INSERT INTO ops.errors SELECT ts, service, path, status FROM ops.requests WHERE status > 400;

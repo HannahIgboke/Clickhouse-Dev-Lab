@@ -1,0 +1,163 @@
+id: 11
+slug: hr-clean
+title: Reshape raw rows into a clean table
+domains: [inserting, analyzing]
+objectives: [I4, I5, A2, M2]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/functions/splitting-merging-functions
+  - https://clickhouse.com/docs/sql-reference/functions/string-functions
+  - https://clickhouse.com/docs/sql-reference/functions/string-replace-functions
+
+brief: |
+  hr.staff_raw holds an HR export with every column as text:
+
+    full_name    'LASTNAME, Firstname'   e.g. 'OKAFOR, Ada'
+    email        mixed case, sometimes with spaces around it
+    dept         department code
+    salary_text  a currency symbol and thousands separators, e.g. '₦1,250,000'
+    hired        'YYYYMMDD'              e.g. '20230115'
+
+  1. Create hr.staff (MergeTree, sorted by dept then last_name) with exactly:
+
+    first_name String, last_name String, email String,
+    dept LowCardinality(String), salary UInt32, hired Date
+
+  2. Fill it from hr.staff_raw in one INSERT ... SELECT: first_name as
+  written ('Ada'); last_name with only its first letter capitalised
+  ('Okafor'); email trimmed and lowercase; salary as a whole number
+  (1250000); hired as a Date.
+
+reset:
+  - DROP DATABASE IF EXISTS hr SYNC
+
+setup:
+  - CREATE DATABASE hr
+  - |
+    CREATE TABLE hr.staff_raw
+    (
+        full_name String, email String, dept String, salary_text String, hired String
+    )
+    ENGINE = MergeTree ORDER BY tuple()
+  - |
+    INSERT INTO hr.staff_raw
+    SELECT
+        concat(upper(last), ', ', first) AS full_name,
+        concat(if(cityHash64(number, {seed}, 3) % 3 = 0, ' ', ''),
+               if(cityHash64(number, {seed}, 4) % 2 = 0, upper(e), e),
+               if(cityHash64(number, {seed}, 5) % 4 = 0, '  ', '')) AS email,
+        ['ENG', 'OPS', 'FIN', 'MKT', 'HR'][1 + (cityHash64(number, {seed}, 6) % 5)] AS dept,
+        concat(['₦', '$', '€'][1 + (cityHash64(number, {seed}, 7) % 3)],
+               if(sal >= 1000000,
+                  concat(toString(intDiv(sal, 1000000)), ',', leftPad(toString(intDiv(sal, 1000) % 1000), 3, '0'), ','),
+                  concat(toString(intDiv(sal, 1000)), ',')),
+               leftPad(toString(sal % 1000), 3, '0')) AS salary_text,
+        formatDateTime(toDate('2015-01-01') + (cityHash64(number, {seed}, 8) % 3650), '%Y%m%d') AS hired
+    FROM
+    (
+        SELECT number,
+               ['Ada', 'Chidi', 'Emeka', 'Fatima', 'Grace', 'Ifeoma', 'Kofi', 'Lena', 'Musa', 'Tobi'][1 + (cityHash64(number, {seed}, 1) % 10)] AS first,
+               ['Okafor', 'Bello', 'Smith', 'Mensah', 'Adeyemi', 'Garcia', 'Nwosu', 'Kim', 'Olsen', 'Diallo'][1 + (cityHash64(number, {seed}, 2) % 10)] AS last,
+               concat(lower(first), '.', lower(last), toString(number), '@corp.example') AS e,
+               toUInt32(150000 + cityHash64(number, {seed}, 9) % 9000000) AS sal
+        FROM numbers(30000)
+    )
+
+checks:
+  - name: hr.staff has exactly the specified columns, engine and sort order
+    type: sql_true
+    points: 20
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'hr' AND table = 'staff' ORDER BY position))
+             = ['first_name String', 'last_name String', 'email String', 'dept LowCardinality(String)', 'salary UInt32', 'hired Date']
+         AND (SELECT engine = 'MergeTree' AND sorting_key = 'dept, last_name' FROM system.tables WHERE database = 'hr' AND name = 'staff')
+    show: |
+      SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'hr' AND table = 'staff' ORDER BY position
+
+  - name: Names split and last names capitalised
+    type: result
+    points: 25
+    query: SELECT count() AS rows, groupBitXor(cityHash64(first_name, last_name, email)) AS fp FROM hr.staff
+    expect: |
+      SELECT count() AS rows,
+             groupBitXor(cityHash64(trimBoth(splitByString(',', full_name)[2]), initcap(lower(splitByString(',', full_name)[1])),
+                                    lower(trimBoth(email)))) AS fp
+      FROM hr.staff_raw
+    hint: splitByString(', ', full_name) gives [last, first]; initcap(lower(x)) capitalises the first letter.
+
+  - name: Emails trimmed and lowercase
+    type: sql_true
+    points: 15
+    query: SELECT count() > 0 AND countIf(email != lower(trimBoth(email))) = 0 FROM hr.staff
+
+  - name: Salaries are whole numbers
+    type: result
+    points: 20
+    query: SELECT sum(salary) AS total, groupBitXor(cityHash64(email, salary)) AS fp FROM hr.staff
+    expect: |
+      SELECT sum(toUInt32(replaceRegexpAll(salary_text, '[^0-9]', ''))) AS total,
+             groupBitXor(cityHash64(lower(trimBoth(email)), toUInt32(replaceRegexpAll(salary_text, '[^0-9]', '')))) AS fp
+      FROM hr.staff_raw
+    hint: Strip everything that is not a digit with replaceRegexpAll(salary_text, '[^0-9]', ''), then convert.
+
+  - name: Hire dates parsed
+    type: result
+    points: 20
+    query: SELECT groupBitXor(cityHash64(email, hired)) AS fp, min(hired) AS lo FROM hr.staff
+    expect: |
+      SELECT groupBitXor(cityHash64(lower(trimBoth(email)), parseDateTime(hired, '%Y%m%d')::Date)) AS fp,
+             min(parseDateTime(hired, '%Y%m%d')::Date) AS lo
+      FROM hr.staff_raw
+
+solution: |
+  SELECT * FROM hr.staff_raw LIMIT 5;
+
+  CREATE TABLE hr.staff
+  (
+      first_name String,
+      last_name  String,
+      email      String,
+      dept       LowCardinality(String),
+      salary     UInt32,
+      hired      Date
+  )
+  ENGINE = MergeTree
+  ORDER BY (dept, last_name);
+
+  INSERT INTO hr.staff
+  SELECT
+      splitByString(', ', full_name)[2]                    AS first_name,
+      initcap(lower(splitByString(', ', full_name)[1]))    AS last_name,
+      lower(trimBoth(email))                               AS email,
+      dept,
+      toUInt32(replaceRegexpAll(salary_text, '[^0-9]', '')) AS salary,
+      parseDateTime(hired, '%Y%m%d')::Date                 AS hired
+  FROM hr.staff_raw;
+
+alternatives:
+  - name: extract() and YYYYMMDDToDate
+    sql: |
+      CREATE TABLE hr.staff (first_name String, last_name String, email String, dept LowCardinality(String),
+        salary UInt32, hired Date) ENGINE = MergeTree ORDER BY (dept, last_name);
+      INSERT INTO hr.staff
+      SELECT extract(full_name, ', (.*)$'),
+             concat(substring(extract(full_name, '^([^,]+)'), 1, 1), lower(substring(extract(full_name, '^([^,]+)'), 2))),
+             lower(trim(email)), dept,
+             toUInt32(arrayStringConcat(extractAll(salary_text, '\\d'))),
+             YYYYMMDDToDate(toUInt32(hired))
+      FROM hr.staff_raw;
+
+wrong_solutions:
+  - name: last name left uppercase, email not trimmed
+    must_fail:
+      - Names split and last names capitalised
+      - Emails trimmed and lowercase
+    sql: |
+      CREATE TABLE hr.staff (first_name String, last_name String, email String, dept LowCardinality(String),
+        salary UInt32, hired Date) ENGINE = MergeTree ORDER BY (dept, last_name);
+      INSERT INTO hr.staff
+      SELECT splitByString(', ', full_name)[2], splitByString(', ', full_name)[1], lower(email), dept,
+             toUInt32(replaceRegexpAll(salary_text, '[^0-9]', '')), parseDateTime(hired, '%Y%m%d')::Date
+      FROM hr.staff_raw;

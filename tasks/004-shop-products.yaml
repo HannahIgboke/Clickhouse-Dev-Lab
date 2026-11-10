@@ -1,0 +1,110 @@
+id: 4
+slug: shop-products
+title: A table to an exact specification
+domains: [modeling]
+objectives: [M1, M2]
+tier: 1
+minutes: 6
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/create/database
+  - https://clickhouse.com/docs/sql-reference/statements/create/table
+  - https://clickhouse.com/docs/sql-reference/data-types
+
+brief: |
+  1. Create a database named shop.
+
+  2. Create the table shop.products with the MergeTree engine, sorted by
+  category and then product_id, and exactly these columns and types:
+
+    product_id   UInt32
+    name         String
+    category     LowCardinality(String)
+    price        Decimal(10, 2)
+    in_stock     Bool
+    tags         Array(String)
+    created_at   DateTime64(3)
+
+  3. Insert these three rows:
+
+    1, 'Desk lamp',   'home',        24.99, true,  ['light', 'desk'], 2025-05-01 10:00:00.123
+    2, 'Notebook',    'office',       3.50, false, [],                2025-05-02 08:30:00.000
+    3, 'USB-C cable', 'electronics',  9.00, true,  ['usb', 'cable'],  2025-05-03 12:00:00.500
+
+reset:
+  - DROP DATABASE IF EXISTS shop SYNC
+
+checks:
+  - name: Database shop exists
+    type: sql_true
+    points: 10
+    query: SELECT count() = 1 FROM system.databases WHERE name = 'shop'
+
+  - name: shop.products has exactly the specified columns and types
+    type: sql_true
+    points: 35
+    query: |
+      SELECT groupArray(concat(name, ' ', type)) = ['product_id UInt32', 'name String',
+        'category LowCardinality(String)', 'price Decimal(10, 2)', 'in_stock Bool',
+        'tags Array(String)', 'created_at DateTime64(3)']
+      FROM (SELECT name, type FROM system.columns WHERE database = 'shop' AND table = 'products' ORDER BY position)
+    show: |
+      SELECT concat(name, ' ', type) FROM system.columns
+      WHERE database = 'shop' AND table = 'products' ORDER BY position
+
+  - name: MergeTree, sorted by (category, product_id)
+    type: sql_true
+    points: 25
+    query: |
+      SELECT engine = 'MergeTree' AND sorting_key = 'category, product_id'
+      FROM system.tables WHERE database = 'shop' AND name = 'products'
+    show: |
+      SELECT concat(engine, ' ORDER BY ', sorting_key) FROM system.tables
+      WHERE database = 'shop' AND name = 'products'
+
+  - name: The three rows are inserted exactly
+    type: result
+    points: 30
+    query: |
+      SELECT product_id, name, category, toString(price) AS price, in_stock, tags, toString(created_at) AS created_at
+      FROM shop.products ORDER BY product_id
+    expect: |
+      SELECT * FROM values('product_id UInt32, name String, category String, price String, in_stock Bool, tags Array(String), created_at String',
+        (1, 'Desk lamp', 'home', '24.99', true, ['light', 'desk'], '2025-05-01 10:00:00.123'),
+        (2, 'Notebook', 'office', '3.5', false, [], '2025-05-02 08:30:00.000'),
+        (3, 'USB-C cable', 'electronics', '9', true, ['usb', 'cable'], '2025-05-03 12:00:00.500'))
+    hint: Strings and DateTime64 values go in single quotes; arrays use square brackets.
+
+solution: |
+  CREATE DATABASE shop;
+
+  CREATE TABLE shop.products
+  (
+      product_id UInt32,
+      name       String,
+      category   LowCardinality(String),
+      price      Decimal(10, 2),
+      in_stock   Bool,
+      tags       Array(String),
+      created_at DateTime64(3)
+  )
+  ENGINE = MergeTree
+  ORDER BY (category, product_id);
+
+  INSERT INTO shop.products VALUES
+      (1, 'Desk lamp', 'home', 24.99, true, ['light', 'desk'], '2025-05-01 10:00:00.123'),
+      (2, 'Notebook', 'office', 3.50, false, [], '2025-05-02 08:30:00.000'),
+      (3, 'USB-C cable', 'electronics', 9.00, true, ['usb', 'cable'], '2025-05-03 12:00:00.500');
+
+wrong_solutions:
+  - name: plain String category, wrong sort order, DateTime
+    must_fail:
+      - shop.products has exactly the specified columns and types
+      - MergeTree, sorted by (category, product_id)
+      - The three rows are inserted exactly
+    sql: |
+      CREATE DATABASE shop;
+      CREATE TABLE shop.products (product_id UInt32, name String, category String, price Decimal(10, 2),
+        in_stock Bool, tags Array(String), created_at DateTime) ENGINE = MergeTree ORDER BY product_id;
+      INSERT INTO shop.products VALUES (1, 'Desk lamp', 'home', 24.99, true, ['light', 'desk'], '2025-05-01 10:00:00'),
+        (2, 'Notebook', 'office', 3.50, false, [], '2025-05-02 08:30:00'),
+        (3, 'USB-C cable', 'electronics', 9.00, true, ['usb', 'cable'], '2025-05-03 12:00:00');

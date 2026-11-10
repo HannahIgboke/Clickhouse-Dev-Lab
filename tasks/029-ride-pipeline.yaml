@@ -1,0 +1,249 @@
+id: 29
+slug: ride-pipeline
+title: "Nightmare: an end-to-end ride analytics pipeline"
+domains: [inserting, optimizing, modeling, analyzing]
+objectives: [I2, I3, I4, O2, M2, M5, A4]
+tier: 4
+minutes: 25
+docs:
+  - https://clickhouse.com/docs/sql-reference/table-functions/s3
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/summingmergetree
+  - https://clickhouse.com/docs/sql-reference/statements/create/dictionary
+  - https://clickhouse.com/docs/sql-reference/functions/type-conversion-functions
+
+brief: |
+  A ride-hailing company drops raw trip exports in S3:
+
+    {s3}/rides/trips.parquet    key {s3_key}   secret {s3_secret}
+
+  Raw columns: trip_id, city_code, driver_id, started_epoch and
+  ended_epoch (Unix seconds), fare_cents (integer) and status (mixed case:
+  'COMPLETED', 'Completed', 'cancelled', ...). The table ride.cities maps
+  city_code to city and country.
+
+  Build this, in an order that loses no data:
+
+  1. ride.trips (MergeTree, sorted by city_code then started_at) with exactly:
+     trip_id UInt64, city_code LowCardinality(String), driver_id UInt32,
+     started_at DateTime, duration_s UInt32, fare Decimal(10, 2),
+     status LowCardinality(String)
+     where duration_s = ended - started, fare = fare_cents / 100 and status is
+     lowercase.
+
+  2. ride.daily_city (SummingMergeTree, sorted by day then city_code) with
+     day Date, city_code LowCardinality(String), completed_trips UInt64,
+     revenue Decimal(18, 2), kept up to date by a materialized view
+     ride.daily_city_mv on ride.trips that counts only completed trips.
+
+  3. Load every trip from S3 into ride.trips, transformed as above.
+
+  4. A dictionary ride.city_dict over ride.cities (key city_code, attributes
+     city and country).
+
+  5. A view answers.ride_country_daily reading ride.daily_city and the
+     dictionary: columns country, day, completed_trips, revenue for September
+     2025, ordered by country then day. Correct before merges.
+
+reset:
+  - DROP DATABASE IF EXISTS ride SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.ride_country_daily SYNC
+
+setup:
+  - CREATE DATABASE ride
+  - |
+    CREATE TABLE ride.cities (city_code String, city String, country LowCardinality(String))
+    ENGINE = MergeTree ORDER BY city_code
+  - |
+    INSERT INTO ride.cities VALUES ('LOS', 'Lagos', 'Nigeria'), ('ABV', 'Abuja', 'Nigeria'), ('PHC', 'Port Harcourt', 'Nigeria'),
+      ('ACC', 'Accra', 'Ghana'), ('KMS', 'Kumasi', 'Ghana'), ('NBO', 'Nairobi', 'Kenya'), ('MBA', 'Mombasa', 'Kenya'),
+      ('JNB', 'Johannesburg', 'South Africa'), ('CPT', 'Cape Town', 'South Africa')
+  - |
+    INSERT INTO FUNCTION s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet')
+    SELECT number + 1 AS trip_id,
+           ['LOS', 'LOS', 'LOS', 'ABV', 'PHC', 'ACC', 'KMS', 'NBO', 'MBA', 'JNB', 'CPT'][1 + (cityHash64(number, {seed}, 1) % 11)] AS city_code,
+           toUInt32(1 + cityHash64(number, {seed}, 2) % 8000) AS driver_id,
+           toUInt32(toUnixTimestamp(toDateTime('2025-08-25 00:00:00', 'UTC')) + (cityHash64(number, {seed}, 3) % (45 * 86400))) AS started_epoch,
+           toUInt32(started_epoch + 180 + (cityHash64(number, {seed}, 4) % 4000)) AS ended_epoch,
+           toInt64(300 + cityHash64(number, {seed}, 5) % 900000) AS fare_cents,
+           ['COMPLETED', 'Completed', 'completed', 'completed', 'cancelled', 'CANCELLED', 'no_show'][1 + (cityHash64(number, {seed}, 6) % 7)] AS status
+    FROM numbers(500000)
+
+checks:
+  - name: ride.trips has the exact columns and sort order
+    type: sql_true
+    points: 10
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'ride' AND table = 'trips' ORDER BY position))
+             = ['trip_id UInt64', 'city_code LowCardinality(String)', 'driver_id UInt32', 'started_at DateTime',
+                'duration_s UInt32', 'fare Decimal(10, 2)', 'status LowCardinality(String)']
+         AND (SELECT engine = 'MergeTree' AND sorting_key = 'city_code, started_at' FROM system.tables WHERE database = 'ride' AND name = 'trips')
+    show: SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'ride' AND table = 'trips' ORDER BY position
+
+  - name: Trips loaded from S3 and transformed
+    type: result
+    points: 20
+    query: |
+      SELECT count() AS n, sum(duration_s) AS d, sum(fare) AS f, countIf(status = 'completed') AS c,
+             groupBitXor(cityHash64(trip_id, toUnixTimestamp(started_at), toString(status))) AS fp
+      FROM ride.trips
+    expect: |
+      SELECT count() AS n, sum(ended_epoch - started_epoch) AS d, sum(toDecimal64(fare_cents / 100, 2)) AS f,
+             countIf(lower(status) = 'completed') AS c,
+             groupBitXor(cityHash64(trip_id, started_epoch, lower(status))) AS fp
+      FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet')
+    hint: toDateTime(started_epoch), ended_epoch - started_epoch, fare_cents / 100, lower(status).
+
+  - name: ride.daily_city is SummingMergeTree with the exact columns, fed by ride.daily_city_mv
+    type: sql_true
+    points: 15
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'ride' AND table = 'daily_city' ORDER BY position))
+             = ['day Date', 'city_code LowCardinality(String)', 'completed_trips UInt64', 'revenue Decimal(18, 2)']
+         AND (SELECT engine = 'SummingMergeTree' AND sorting_key = 'day, city_code' FROM system.tables WHERE database = 'ride' AND name = 'daily_city')
+         AND (SELECT engine = 'MaterializedView' AND match(create_table_query, 'TO ride\\.daily_city\\b') FROM system.tables WHERE database = 'ride' AND name = 'daily_city_mv')
+
+  - name: daily_city holds every completed trip exactly once
+    type: result
+    points: 20
+    query: |
+      SELECT sum(completed_trips) AS t, sum(revenue) AS r,
+             groupBitXor(cityHash64(day, toString(city_code), ct)) AS fp
+      FROM (SELECT day, city_code, sum(completed_trips) AS ct, ct AS completed_trips, sum(revenue) AS revenue
+            FROM ride.daily_city GROUP BY day, city_code)
+    expect: |
+      SELECT sum(c) AS t, sum(r) AS r, groupBitXor(cityHash64(day, toString(city_code), c)) AS fp
+      FROM (SELECT toDate(toDateTime(started_epoch)) AS day, city_code, count() AS c, sum(toDecimal64(fare_cents / 100, 2)) AS r
+            FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet')
+            WHERE lower(status) = 'completed' GROUP BY day, city_code)
+    hint: >-
+      Create the materialized view before loading ride.trips (or backfill after). Loading twice, or
+      backfilling after the view already saw the load, double-counts.
+
+  - name: ride.city_dict returns city and country
+    type: sql_true
+    points: 10
+    query: |
+      SELECT dictGet('ride.city_dict', 'country', 'KMS') = 'Ghana' AND dictGet('ride.city_dict', 'city', 'CPT') = 'Cape Town'
+
+  - name: answers.ride_country_daily is right before merges
+    type: result
+    points: 25
+    prepare:
+      - CREATE DATABASE IF NOT EXISTS chlab_grader
+      - CREATE TABLE chlab_grader.dc AS ride.daily_city
+      - SYSTEM STOP MERGES chlab_grader.dc
+      - |
+        INSERT INTO chlab_grader.dc SELECT toDate(started_at), city_code, count(), sum(fare) FROM ride.trips
+        WHERE status = 'completed' AND driver_id % 2 = 0 GROUP BY 1, 2
+      - |
+        INSERT INTO chlab_grader.dc SELECT toDate(started_at), city_code, count(), sum(fare) FROM ride.trips
+        WHERE status = 'completed' AND driver_id % 2 = 1 GROUP BY 1, 2
+    query: |
+      SELECT toString(country) AS country, day, toUInt64(completed_trips) AS t, toFloat64(revenue) AS r
+      FROM {as_select:answers.ride_country_daily|ride.daily_city=>chlab_grader.dc}
+    expect: |
+      SELECT c.country AS country, toDate(toDateTime(t.started_epoch)) AS day, count() AS t, toFloat64(sum(toDecimal64(t.fare_cents / 100, 2))) AS r
+      FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet') AS t
+      INNER JOIN ride.cities AS c ON t.city_code = c.city_code
+      WHERE lower(t.status) = 'completed' AND toYYYYMM(toDateTime(t.started_epoch)) = 202509
+      GROUP BY country, day ORDER BY country, day
+    cleanup:
+      - DROP DATABASE IF EXISTS chlab_grader SYNC
+    hint: Group by dictGet(...) AS country and day, with sum() over the SummingMergeTree columns.
+
+solution: |
+  DESCRIBE s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+
+  CREATE TABLE ride.trips
+  (
+      trip_id    UInt64,
+      city_code  LowCardinality(String),
+      driver_id  UInt32,
+      started_at DateTime,
+      duration_s UInt32,
+      fare       Decimal(10, 2),
+      status     LowCardinality(String)
+  )
+  ENGINE = MergeTree
+  ORDER BY (city_code, started_at);
+
+  CREATE TABLE ride.daily_city
+  (
+      day             Date,
+      city_code       LowCardinality(String),
+      completed_trips UInt64,
+      revenue         Decimal(18, 2)
+  )
+  ENGINE = SummingMergeTree
+  ORDER BY (day, city_code);
+
+  -- The view first, so the load below flows through it.
+  CREATE MATERIALIZED VIEW ride.daily_city_mv TO ride.daily_city AS
+  SELECT toDate(started_at) AS day, city_code, count() AS completed_trips, sum(fare) AS revenue
+  FROM ride.trips
+  WHERE status = 'completed'
+  GROUP BY day, city_code;
+
+  INSERT INTO ride.trips
+  SELECT trip_id, city_code, driver_id,
+         toDateTime(started_epoch)          AS started_at,
+         ended_epoch - started_epoch        AS duration_s,
+         toDecimal64(fare_cents / 100, 2)   AS fare,
+         lower(status)                      AS status
+  FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+
+  CREATE DICTIONARY ride.city_dict (city_code String, city String, country String)
+  PRIMARY KEY city_code
+  SOURCE(CLICKHOUSE(DB 'ride' TABLE 'cities'))
+  LAYOUT(COMPLEX_KEY_HASHED())
+  LIFETIME(MIN 0 MAX 3600);
+
+  CREATE VIEW answers.ride_country_daily AS
+  SELECT dictGet('ride.city_dict', 'country', city_code) AS country, day,
+         sum(completed_trips) AS completed_trips, sum(revenue) AS revenue
+  FROM ride.daily_city
+  WHERE day >= '2025-09-01' AND day < '2025-10-01'
+  GROUP BY country, day
+  ORDER BY country, day;
+
+wrong_solutions:
+  - name: view created after the load, never backfilled
+    must_fail:
+      - daily_city holds every completed trip exactly once
+    sql: |
+      CREATE TABLE ride.trips (trip_id UInt64, city_code LowCardinality(String), driver_id UInt32, started_at DateTime,
+        duration_s UInt32, fare Decimal(10, 2), status LowCardinality(String)) ENGINE = MergeTree ORDER BY (city_code, started_at);
+      INSERT INTO ride.trips SELECT trip_id, city_code, driver_id, toDateTime(started_epoch), ended_epoch - started_epoch,
+        toDecimal64(fare_cents / 100, 2), lower(status) FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+      CREATE TABLE ride.daily_city (day Date, city_code LowCardinality(String), completed_trips UInt64, revenue Decimal(18, 2))
+        ENGINE = SummingMergeTree ORDER BY (day, city_code);
+      CREATE MATERIALIZED VIEW ride.daily_city_mv TO ride.daily_city AS
+        SELECT toDate(started_at) AS day, city_code, count() AS completed_trips, sum(fare) AS revenue
+        FROM ride.trips WHERE status = 'completed' GROUP BY day, city_code;
+      CREATE DICTIONARY ride.city_dict (city_code String, city String, country String) PRIMARY KEY city_code
+        SOURCE(CLICKHOUSE(DB 'ride' TABLE 'cities')) LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(0);
+      CREATE VIEW answers.ride_country_daily AS
+        SELECT dictGet('ride.city_dict', 'country', city_code) AS country, day, sum(completed_trips) AS completed_trips,
+               sum(revenue) AS revenue FROM ride.daily_city WHERE toYYYYMM(day) = 202509 GROUP BY country, day ORDER BY country, day;
+  - name: status not lowercased (mixed-case completed trips missed)
+    must_fail:
+      - Trips loaded from S3 and transformed
+      - daily_city holds every completed trip exactly once
+    sql: |
+      CREATE TABLE ride.trips (trip_id UInt64, city_code LowCardinality(String), driver_id UInt32, started_at DateTime,
+        duration_s UInt32, fare Decimal(10, 2), status LowCardinality(String)) ENGINE = MergeTree ORDER BY (city_code, started_at);
+      CREATE TABLE ride.daily_city (day Date, city_code LowCardinality(String), completed_trips UInt64, revenue Decimal(18, 2))
+        ENGINE = SummingMergeTree ORDER BY (day, city_code);
+      CREATE MATERIALIZED VIEW ride.daily_city_mv TO ride.daily_city AS
+        SELECT toDate(started_at) AS day, city_code, count() AS completed_trips, sum(fare) AS revenue
+        FROM ride.trips WHERE status = 'completed' GROUP BY day, city_code;
+      INSERT INTO ride.trips SELECT trip_id, city_code, driver_id, toDateTime(started_epoch), ended_epoch - started_epoch,
+        toDecimal64(fare_cents / 100, 2), status FROM s3('{s3}/rides/trips.parquet', '{s3_key}', '{s3_secret}', 'Parquet');
+      CREATE DICTIONARY ride.city_dict (city_code String, city String, country String) PRIMARY KEY city_code
+        SOURCE(CLICKHOUSE(DB 'ride' TABLE 'cities')) LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(0);
+      CREATE VIEW answers.ride_country_daily AS
+        SELECT dictGet('ride.city_dict', 'country', city_code) AS country, day, sum(completed_trips) AS completed_trips,
+               sum(revenue) AS revenue FROM ride.daily_city WHERE toYYYYMM(day) = 202509 GROUP BY country, day ORDER BY country, day;

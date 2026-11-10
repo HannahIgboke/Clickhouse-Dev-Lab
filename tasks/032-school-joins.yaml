@@ -1,0 +1,121 @@
+id: 32
+slug: school-joins
+title: "Stretch: LEFT and anti joins, ClickHouse style"
+domains: [stretch]
+objectives: [S2, A1, A3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/select/join
+  - https://clickhouse.com/docs/operations/settings/settings#join_use_nulls
+
+brief: |
+  school.students (student_id, name), school.courses (course_id, title) and
+  school.enrollments (student_id, course_id, grade) describe a small school.
+  Some courses have nobody enrolled; some students take no course.
+
+  1. Create a view answers.course_stats with one row per course, ordered by
+  title, columns title, students (the number enrolled, 0 when none) and
+  avg_grade (the average grade rounded to 1 decimal, 0 when none).
+
+  2. Create a view answers.unenrolled with one column name: the students
+  who are in no course at all, ordered by name.
+
+reset:
+  - DROP DATABASE IF EXISTS school SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.course_stats SYNC
+  - DROP VIEW IF EXISTS answers.unenrolled SYNC
+
+setup:
+  - CREATE DATABASE school
+  - CREATE TABLE school.students (student_id UInt32, name String) ENGINE = MergeTree ORDER BY student_id
+  - |
+    INSERT INTO school.students
+    SELECT number + 1, concat(['Ada', 'Bayo', 'Chi', 'Dami', 'Efe', 'Femi', 'Gozie', 'Halima'][1 + number % 8], ' ', toString(number + 1))
+    FROM numbers(3000)
+  - CREATE TABLE school.courses (course_id UInt16, title String) ENGINE = MergeTree ORDER BY course_id
+  - |
+    INSERT INTO school.courses
+    SELECT number + 1, concat(['Algebra', 'Biology', 'Chemistry', 'Drama', 'Economics', 'French', 'Geography', 'History',
+                               'Igbo', 'Japanese', 'Kinetics', 'Literature'][1 + number % 12], if(number >= 12, ' II', ''))
+    FROM numbers(18)
+  - CREATE TABLE school.enrollments (student_id UInt32, course_id UInt16, grade UInt8) ENGINE = MergeTree ORDER BY (course_id, student_id)
+  - |
+    INSERT INTO school.enrollments
+    SELECT DISTINCT ON (s, c) s, c, toUInt8(40 + cityHash64(s, c, {seed}) % 61)
+    FROM (SELECT toUInt32(1 + cityHash64(number, {seed}, 1) % 2600) AS s, toUInt16(1 + cityHash64(number, {seed}, 2) % 14) AS c FROM numbers(9000))
+
+checks:
+  - name: course_stats counts 0 students for empty courses
+    type: result
+    points: 40
+    query: SELECT title, toUInt64(students) AS n FROM answers.course_stats
+    expect: |
+      SELECT c.title AS title, toUInt64(countIf(e.course_id IS NOT NULL)) AS n
+      FROM school.courses AS c LEFT JOIN school.enrollments AS e ON c.course_id = e.course_id
+      GROUP BY title ORDER BY title
+      SETTINGS join_use_nulls = 1
+    hint: >-
+      With the default join_use_nulls = 0, unmatched LEFT JOIN columns hold default values (0, ''),
+      not NULL, so count(e.student_id) counts them. Aggregate enrollments first, or set join_use_nulls = 1.
+
+  - name: avg_grade rounded, 0 for empty courses
+    type: result
+    points: 25
+    tolerance: 0.0000001
+    query: SELECT title, toFloat64(avg_grade) AS g FROM answers.course_stats
+    expect: |
+      SELECT c.title AS title, toFloat64(ifNull(round(avg(e.grade), 1), 0)) AS g
+      FROM school.courses AS c LEFT JOIN school.enrollments AS e ON c.course_id = e.course_id
+      GROUP BY title ORDER BY title
+      SETTINGS join_use_nulls = 1
+
+  - name: unenrolled lists exactly the students in no course
+    type: result
+    points: 35
+    query: SELECT name FROM answers.unenrolled
+    expect: |
+      SELECT name FROM school.students WHERE student_id NOT IN (SELECT student_id FROM school.enrollments) ORDER BY name
+    hint: LEFT ANTI JOIN school.enrollments, or WHERE student_id NOT IN (SELECT student_id FROM school.enrollments).
+
+solution: |
+  CREATE VIEW answers.course_stats AS
+  SELECT c.title AS title, ifNull(e.students, 0) AS students, ifNull(e.avg_grade, 0) AS avg_grade
+  FROM school.courses AS c
+  LEFT JOIN
+  (
+      SELECT course_id, count() AS students, round(avg(grade), 1) AS avg_grade
+      FROM school.enrollments GROUP BY course_id
+  ) AS e ON c.course_id = e.course_id
+  ORDER BY title;
+
+  CREATE VIEW answers.unenrolled AS
+  SELECT s.name AS name
+  FROM school.students AS s
+  LEFT ANTI JOIN school.enrollments AS e ON s.student_id = e.student_id
+  ORDER BY name;
+
+alternatives:
+  - name: join_use_nulls and NOT IN
+    sql: |
+      CREATE VIEW answers.course_stats AS
+      SELECT c.title AS title, count(e.student_id) AS students, ifNull(round(avg(e.grade), 1), 0) AS avg_grade
+      FROM school.courses AS c LEFT JOIN school.enrollments AS e ON c.course_id = e.course_id
+      GROUP BY title ORDER BY title SETTINGS join_use_nulls = 1;
+      CREATE VIEW answers.unenrolled AS
+      SELECT name FROM school.students WHERE student_id NOT IN (SELECT student_id FROM school.enrollments) ORDER BY name;
+
+wrong_solutions:
+  - name: count() over a LEFT JOIN with default values
+    must_fail:
+      - course_stats counts 0 students for empty courses
+      - unenrolled lists exactly the students in no course
+    sql: |
+      CREATE VIEW answers.course_stats AS
+      SELECT c.title AS title, count(e.student_id) AS students, round(avg(e.grade), 1) AS avg_grade
+      FROM school.courses AS c LEFT JOIN school.enrollments AS e ON c.course_id = e.course_id
+      GROUP BY title ORDER BY title;
+      CREATE VIEW answers.unenrolled AS
+      SELECT s.name AS name FROM school.students AS s LEFT JOIN school.enrollments AS e ON s.student_id = e.student_id
+      WHERE e.student_id IS NULL ORDER BY name;

@@ -1,0 +1,107 @@
+id: 5
+slug: geo-tsv
+title: Load a headerless TSV in a different column order
+domains: [inserting]
+objectives: [I1, I3]
+tier: 1
+minutes: 6
+docs:
+  - https://clickhouse.com/docs/interfaces/formats/TabSeparated
+  - https://clickhouse.com/docs/sql-reference/statements/insert-into
+
+brief: |
+  The table geo.cities already exists:
+
+    city String, country LowCardinality(String), population UInt32, lat Float64, lon Float64
+
+  The file /data/cities.tsv is tab-separated with NO header row, and its
+  columns come in this order:
+
+    country, city, lat, lon, population
+
+  Insert every row of the file into geo.cities so that each value lands in
+  the right column.
+
+reset:
+  - DROP DATABASE IF EXISTS geo SYNC
+
+setup:
+  - CREATE DATABASE geo
+  - |
+    CREATE TABLE geo.cities
+    (
+        city       String,
+        country    LowCardinality(String),
+        population UInt32,
+        lat        Float64,
+        lon        Float64
+    )
+    ENGINE = MergeTree
+    ORDER BY (country, city)
+
+files:
+  - path: cities.tsv
+    format: TabSeparated
+    query: |
+      SELECT
+          ['Nigeria', 'Ghana', 'Kenya', 'Egypt', 'Brazil', 'India', 'Japan', 'Germany', 'Canada', 'Peru'][1 + (cityHash64(number, {seed}, 1) % 10)] AS country,
+          concat(['Port ', 'New ', 'San ', 'Lake ', 'Fort ', ''][1 + (cityHash64(number, {seed}, 2) % 6)],
+                 ['Ada', 'Bole', 'Kano', 'Lima', 'Oslo', 'Rio', 'Tema', 'Ubon', 'Vale', 'Zaria'][1 + (cityHash64(number, {seed}, 3) % 10)],
+                 ' ', toString(number)) AS city,
+          round(-60 + (cityHash64(number, {seed}, 4) % 1200000) / 10000, 4) AS lat,
+          round(-180 + (cityHash64(number, {seed}, 5) % 3600000) / 10000, 4) AS lon,
+          toUInt32(1000 + cityHash64(number, {seed}, 6) % 9000000) AS population
+      FROM numbers(20000)
+
+checks:
+  - name: All 20,000 rows loaded once
+    type: sql_true
+    points: 30
+    query: SELECT count() = 20000 FROM geo.cities
+    show: SELECT count() FROM geo.cities
+
+  - name: Every city sits next to its own country
+    type: result
+    points: 40
+    query: SELECT groupBitXor(cityHash64(city, toString(country))) AS pairs FROM geo.cities
+    expect: |
+      SELECT groupBitXor(cityHash64(city, country)) AS pairs
+      FROM file('cities.tsv', 'TabSeparated', 'country String, city String, lat Float64, lon Float64, population UInt32')
+    hint: Name the target columns in the file's order, e.g. INSERT INTO geo.cities (country, city, ...) FROM INFILE ...
+
+  - name: Populations and coordinates in the right columns
+    type: result
+    points: 30
+    query: SELECT sum(population) AS pop, round(sum(lat), 2) AS lat, round(sum(lon), 2) AS lon FROM geo.cities
+    expect: |
+      SELECT sum(population) AS pop, round(sum(lat), 2) AS lat, round(sum(lon), 2) AS lon
+      FROM file('cities.tsv', 'TabSeparated', 'country String, city String, lat Float64, lon Float64, population UInt32')
+
+solution: |
+  -- Peek at the file: no header, so columns are named c1, c2, ...
+  SELECT * FROM file('cities.tsv', 'TabSeparated') LIMIT 3;
+
+  INSERT INTO geo.cities (country, city, lat, lon, population)
+  FROM INFILE '/data/cities.tsv' FORMAT TabSeparated;
+
+alternatives:
+  - name: INSERT ... SELECT from file() with an explicit structure
+    sql: |
+      INSERT INTO geo.cities
+      SELECT city, country, population, lat, lon
+      FROM file('cities.tsv', 'TSV', 'country String, city String, lat Float64, lon Float64, population UInt32');
+
+wrong_solutions:
+  - name: city and country swapped
+    must_fail:
+      - Every city sits next to its own country
+    sql: |
+      INSERT INTO geo.cities (city, country, lat, lon, population)
+      FROM INFILE '/data/cities.tsv' FORMAT TabSeparated;
+  - name: loaded twice
+    must_fail:
+      - All 20,000 rows loaded once
+      - Populations and coordinates in the right columns
+    sql: |
+      INSERT INTO geo.cities (country, city, lat, lon, population) FROM INFILE '/data/cities.tsv' FORMAT TabSeparated;
+      INSERT INTO geo.cities (country, city, lat, lon, population) FROM INFILE '/data/cities.tsv' FORMAT TabSeparated;

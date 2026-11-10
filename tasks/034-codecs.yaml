@@ -1,0 +1,105 @@
+id: 34
+slug: codecs
+title: "Stretch: halve storage with column codecs"
+domains: [stretch]
+objectives: [S4, M2, M3, I5]
+tier: 3
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/statements/create/table#column_compression_codec
+  - https://clickhouse.com/docs/data-compression/compression-in-clickhouse
+
+brief: |
+  sensors.readings stores sensor data (sensor_id, ts, temp, humidity),
+  sorted by sensor_id then ts, with the default LZ4 compression. Each
+  sensor reports every 10 seconds, and values change slowly.
+
+  1. Create sensors.readings_v2 with the same columns, types and sort order,
+  but with column codecs suited to the data: a delta-style codec for ts, a
+  floating-point codec for temp, and ZSTD as the general-purpose codec after
+  the specialised ones.
+
+  2. Copy all rows into it.
+
+  Target: the compressed size of readings_v2 must be at most 50% of
+  sensors.readings. Compare with system.columns (data_compressed_bytes).
+
+reset:
+  - DROP DATABASE IF EXISTS sensors SYNC
+
+setup:
+  - CREATE DATABASE sensors
+  - |
+    CREATE TABLE sensors.readings (sensor_id UInt16, ts DateTime, temp Float32, humidity UInt8)
+    ENGINE = MergeTree ORDER BY (sensor_id, ts)
+  - |
+    INSERT INTO sensors.readings
+    SELECT s, toDateTime('2025-10-01 00:00:00') + i * 10,
+           toFloat32(round(20 + 5 * sin((i + s * 100) / 500) + (cityHash64(s, i, {seed}) % 10) / 100, 2)),
+           toUInt8(40 + 20 * sin((i + s * 7) / 900) + cityHash64(s, i, {seed}, 2) % 3)
+    FROM (SELECT intDiv(number, 30000) AS s, number % 30000 AS i FROM numbers(3000000))
+  - OPTIMIZE TABLE sensors.readings FINAL
+
+checks:
+  - name: Same columns, types and sort order
+    type: sql_true
+    points: 15
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns WHERE database = 'sensors' AND table = 'readings_v2' ORDER BY position))
+           = (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns WHERE database = 'sensors' AND table = 'readings' ORDER BY position))
+         AND (SELECT sorting_key FROM system.tables WHERE database = 'sensors' AND name = 'readings_v2') = 'sensor_id, ts'
+
+  - name: Delta-style codec on ts, float codec on temp, ZSTD after them
+    type: sql_true
+    points: 30
+    query: |
+      SELECT match(anyIf(compression_codec, name = 'ts'), 'Delta|DoubleDelta')
+         AND match(anyIf(compression_codec, name = 'ts'), 'ZSTD')
+         AND match(anyIf(compression_codec, name = 'temp'), 'Gorilla|FPC')
+         AND match(anyIf(compression_codec, name = 'temp'), 'ZSTD')
+      FROM system.columns WHERE database = 'sensors' AND table = 'readings_v2'
+    show: SELECT concat(name, ' ', compression_codec) FROM system.columns WHERE database = 'sensors' AND table = 'readings_v2'
+    hint: ts DateTime CODEC(DoubleDelta, ZSTD), temp Float32 CODEC(Gorilla, ZSTD)
+
+  - name: All rows copied
+    type: result
+    points: 20
+    query: SELECT count() AS n, groupBitXor(cityHash64(sensor_id, ts, temp, humidity)) AS fp FROM sensors.readings_v2
+    expect: SELECT count() AS n, groupBitXor(cityHash64(sensor_id, ts, temp, humidity)) AS fp FROM sensors.readings
+
+  - name: Compressed size at most 50% of the original
+    type: sql_true
+    points: 35
+    prepare:
+      - OPTIMIZE TABLE sensors.readings_v2 FINAL
+    query: |
+      SELECT sumIf(data_compressed_bytes, table = 'readings_v2') <= 0.5 * sumIf(data_compressed_bytes, table = 'readings')
+      FROM system.columns WHERE database = 'sensors'
+    show: |
+      SELECT concat('v2 is ', toString(round(100 * sumIf(data_compressed_bytes, table = 'readings_v2') / sumIf(data_compressed_bytes, table = 'readings'))), '% of the original')
+      FROM system.columns WHERE database = 'sensors'
+
+solution: |
+  SELECT name, formatReadableSize(data_compressed_bytes) AS compressed, formatReadableSize(data_uncompressed_bytes) AS raw
+  FROM system.columns WHERE database = 'sensors' AND table = 'readings';
+
+  CREATE TABLE sensors.readings_v2
+  (
+      sensor_id UInt16  CODEC(ZSTD),
+      ts        DateTime CODEC(DoubleDelta, ZSTD),
+      temp      Float32 CODEC(Gorilla, ZSTD),
+      humidity  UInt8   CODEC(T64, ZSTD)
+  )
+  ENGINE = MergeTree
+  ORDER BY (sensor_id, ts);
+
+  INSERT INTO sensors.readings_v2 SELECT * FROM sensors.readings;
+
+wrong_solutions:
+  - name: ZSTD only
+    must_fail:
+      - Delta-style codec on ts, float codec on temp, ZSTD after them
+    sql: |
+      CREATE TABLE sensors.readings_v2 (sensor_id UInt16 CODEC(ZSTD), ts DateTime CODEC(ZSTD), temp Float32 CODEC(ZSTD), humidity UInt8 CODEC(ZSTD))
+      ENGINE = MergeTree ORDER BY (sensor_id, ts);
+      INSERT INTO sensors.readings_v2 SELECT * FROM sensors.readings;

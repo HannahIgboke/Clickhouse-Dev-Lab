@@ -1,0 +1,46 @@
+# ClickHouse Dev Lab practice environment.
+# One ClickHouse server, where you work in clickhouse-client just like the exam,
+# plus a small S3-compatible server for the "insert from cloud storage" tasks.
+# Start both with `chlab up` (or `docker compose up -d`).
+name: clickhouse-dev-lab
+
+services:
+  clickhouse:
+    # Pinned to the 25.8 LTS line. Bump deliberately and re-run `chlab selftest`.
+    image: clickhouse/clickhouse-server:25.8
+    container_name: chlab-clickhouse
+    environment:
+      # Keep the passwordless `default` user with network access.
+      # Ports below are bound to localhost only.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      # The user_files mount is read-only; skip the entrypoint's chown so the
+      # server starts cleanly on Docker Desktop/Windows (harmless elsewhere).
+      CLICKHOUSE_DO_NOT_CHOWN: "1"
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP (used by chlab and the grader)
+      - "127.0.0.1:9000:9000"   # native protocol (clickhouse-client)
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      # Task files: read them as /data/<file> with FROM INFILE,
+      # or as file('<file>') thanks to the user_files mount.
+      - ./workspace/data:/data:ro
+      - ./workspace/data:/var/lib/clickhouse/user_files:ro
+    working_dir: /data
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+    depends_on:
+      - s3
+
+  # S3-compatible stand-in (moto). Inside Docker, ClickHouse reaches it at
+  # http://s3:5000/chlab-data/... Data lives in memory: `chlab start` re-creates it.
+  s3:
+    image: motoserver/moto:latest
+    container_name: chlab-s3
+    ports:
+      - "127.0.0.1:9002:5000"
+
+volumes:
+  ch-data:

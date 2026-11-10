@@ -1,0 +1,130 @@
+id: 26
+slug: mail-domains
+title: Sender domains for invoice emails
+domains: [analyzing]
+objectives: [A1, A2, A3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/functions/string-search-functions
+  - https://clickhouse.com/docs/sql-reference/functions/splitting-merging-functions
+  - https://clickhouse.com/docs/sql-reference/functions/array-functions#length
+
+brief: |
+  mail.messages has one row per email: sent_at, from_addr (in random case),
+  to_addrs (an Array(String) of recipients), subject and size_bytes.
+
+  Create a view answers.invoice_senders covering only messages whose subject
+  contains the word invoice in any letter case. It returns the 10 sender
+  domains with the most such messages, most first (ties by domain), with the
+  columns:
+
+    domain      the part of from_addr after the @, in lowercase
+    messages    the number of messages
+    recipients  the total number of recipient addresses across them
+    avg_kb      their average size in kilobytes (size_bytes / 1024), rounded
+                to 1 decimal place
+
+reset:
+  - DROP DATABASE IF EXISTS mail SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.invoice_senders SYNC
+
+setup:
+  - CREATE DATABASE mail
+  - |
+    CREATE TABLE mail.messages (sent_at DateTime, from_addr String, to_addrs Array(String), subject String, size_bytes UInt32)
+    ENGINE = MergeTree ORDER BY sent_at
+  - |
+    INSERT INTO mail.messages
+    SELECT toDateTime('2025-04-01 00:00:00') + (cityHash64(number, {seed}, 1) % (60 * 86400)),
+           concat(['billing', 'noreply', 'ada', 'sales'][1 + (cityHash64(number, {seed}, 2) % 4)], '@',
+                  if(cityHash64(number, {seed}, 3) % 2 = 0, upper(dom), dom)),
+           arrayMap(i -> concat('user', toString(i), '@client.example'), range(1 + (cityHash64(number, {seed}, 4) % 4))),
+           concat(['Your ', 'RE: ', 'Fwd: ', ''][1 + (cityHash64(number, {seed}, 5) % 4)],
+                  ['Invoice', 'INVOICE', 'invoice', 'Receipt', 'Newsletter', 'Meeting'][1 + (cityHash64(number, {seed}, 6) % 6)],
+                  ' #', toString(number)),
+           toUInt32(2000 + cityHash64(number, {seed}, 7) % 400000)
+    FROM (SELECT number, concat(['acme', 'globex', 'initech', 'umbrella', 'hooli', 'stark', 'wayne', 'wonka', 'tyrell', 'cyberdyne',
+                                 'soylent', 'oscorp'][1 + (cityHash64(number, {seed}, 8) % 12)], '.example') AS dom
+          FROM numbers(250000))
+
+checks:
+  - name: answers.invoice_senders has the four columns
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['domain', 'messages', 'recipients', 'avg_kb']
+      FROM (SELECT name FROM system.columns WHERE database = 'answers' AND table = 'invoice_senders' ORDER BY position)
+    show: SELECT name FROM system.columns WHERE database = 'answers' AND table = 'invoice_senders' ORDER BY position
+
+  - name: Domains lowercased, invoice matched case-insensitively, top 10 in order
+    type: result
+    points: 40
+    query: SELECT domain, messages FROM answers.invoice_senders
+    expect: |
+      SELECT lower(splitByChar('@', from_addr)[2]) AS domain, count() AS messages
+      FROM mail.messages WHERE positionCaseInsensitive(subject, 'invoice') > 0
+      GROUP BY domain ORDER BY messages DESC, domain LIMIT 10
+    hint: >-
+      lower(splitByChar('@', from_addr)[2]) extracts the domain. subject ILIKE '%invoice%' matches any case.
+
+  - name: recipients counts array elements
+    type: result
+    points: 25
+    query: SELECT domain, recipients FROM answers.invoice_senders
+    expect: |
+      SELECT lower(splitByChar('@', from_addr)[2]) AS domain, sum(length(to_addrs)) AS recipients
+      FROM mail.messages WHERE positionCaseInsensitive(subject, 'invoice') > 0
+      GROUP BY domain ORDER BY count() DESC, domain LIMIT 10
+    hint: length(to_addrs) is the number of elements in the array; sum it.
+
+  - name: avg_kb rounded to one decimal
+    type: result
+    points: 25
+    query: SELECT domain, avg_kb FROM answers.invoice_senders
+    expect: |
+      SELECT lower(splitByChar('@', from_addr)[2]) AS domain, round(avg(size_bytes) / 1024, 1) AS avg_kb
+      FROM mail.messages WHERE positionCaseInsensitive(subject, 'invoice') > 0
+      GROUP BY domain ORDER BY count() DESC, domain LIMIT 10
+
+solution: |
+  CREATE VIEW answers.invoice_senders AS
+  SELECT
+      lower(splitByChar('@', from_addr)[2]) AS domain,
+      count()                               AS messages,
+      sum(length(to_addrs))                 AS recipients,
+      round(avg(size_bytes) / 1024, 1)      AS avg_kb
+  FROM mail.messages
+  WHERE subject ILIKE '%invoice%'
+  GROUP BY domain
+  ORDER BY messages DESC, domain
+  LIMIT 10;
+
+alternatives:
+  - name: substring after position of @, match() with (?i)
+    sql: |
+      CREATE VIEW answers.invoice_senders AS
+      SELECT lowerUTF8(substring(from_addr, position(from_addr, '@') + 1)) AS domain, count() AS messages,
+             sum(length(to_addrs)) AS recipients, round(avg(size_bytes / 1024), 1) AS avg_kb
+      FROM mail.messages WHERE match(subject, '(?i)invoice')
+      GROUP BY domain ORDER BY messages DESC, domain ASC LIMIT 10;
+
+wrong_solutions:
+  - name: case-sensitive match, domain not lowercased
+    must_fail:
+      - Domains lowercased, invoice matched case-insensitively, top 10 in order
+    sql: |
+      CREATE VIEW answers.invoice_senders AS
+      SELECT splitByChar('@', from_addr)[2] AS domain, count() AS messages, sum(length(to_addrs)) AS recipients,
+             round(avg(size_bytes) / 1024, 1) AS avg_kb
+      FROM mail.messages WHERE subject LIKE '%Invoice%' GROUP BY domain ORDER BY messages DESC, domain LIMIT 10;
+  - name: counts messages instead of recipients, no rounding
+    must_fail:
+      - recipients counts array elements
+      - avg_kb rounded to one decimal
+    sql: |
+      CREATE VIEW answers.invoice_senders AS
+      SELECT lower(splitByChar('@', from_addr)[2]) AS domain, count() AS messages, count(to_addrs) AS recipients,
+             avg(size_bytes) / 1024 AS avg_kb
+      FROM mail.messages WHERE subject ILIKE '%invoice%' GROUP BY domain ORDER BY messages DESC, domain LIMIT 10;

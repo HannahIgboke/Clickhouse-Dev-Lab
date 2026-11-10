@@ -1,0 +1,167 @@
+id: 18
+slug: mv-aggregating
+title: Hourly unique users with AggregatingMergeTree
+domains: [optimizing, analyzing]
+objectives: [O2, A3, A4]
+tier: 3
+minutes: 15
+docs:
+  - https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/combinators#-state
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/combinators#-merge
+
+brief: |
+  metrics.requests holds API requests: ts, endpoint, user_id (UInt64) and
+  latency_ms (UInt32).
+
+  1. Create metrics.hourly using AggregatingMergeTree, sorted by endpoint then
+  hour, with exactly these columns:
+
+    hour         DateTime
+    endpoint     LowCardinality(String)
+    users        AggregateFunction(uniq, UInt64)
+    avg_latency  AggregateFunction(avg, UInt32)
+
+  2. Create a materialized view metrics.hourly_mv TO metrics.hourly that
+  fills it from metrics.requests as data arrives (hour = the start of the
+  hour). Include the rows already in metrics.requests.
+
+  3. Create a view answers.checkout_hourly that reads metrics.hourly and
+  returns, for endpoint '/checkout' on 2025-08-15, one row per hour with
+  columns hour, users (unique users) and avg_latency (average latency),
+  ordered by hour.
+
+reset:
+  - DROP DATABASE IF EXISTS metrics SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.checkout_hourly SYNC
+
+setup:
+  - CREATE DATABASE metrics
+  - |
+    CREATE TABLE metrics.requests (ts DateTime, endpoint LowCardinality(String), user_id UInt64, latency_ms UInt32)
+    ENGINE = MergeTree ORDER BY (endpoint, ts)
+  - |
+    INSERT INTO metrics.requests
+    SELECT toDateTime('2025-08-14 00:00:00') + (cityHash64(number, {seed}, 1) % (3 * 86400)),
+           ['/checkout', '/cart', '/search', '/login'][1 + (cityHash64(number, {seed}, 2) % 4)],
+           cityHash64(number, {seed}, 3) % 20000,
+           toUInt32(20 + cityHash64(number, {seed}, 4) % 2000)
+    FROM numbers(800000)
+
+checks:
+  - name: metrics.hourly has the exact columns, AggregatingMergeTree, sorted by (endpoint, hour)
+    type: sql_true
+    points: 20
+    query: |
+      SELECT (SELECT groupArray(concat(name, ' ', type)) FROM (SELECT name, type FROM system.columns
+               WHERE database = 'metrics' AND table = 'hourly' ORDER BY position))
+             = ['hour DateTime', 'endpoint LowCardinality(String)', 'users AggregateFunction(uniq, UInt64)',
+                'avg_latency AggregateFunction(avg, UInt32)']
+         AND (SELECT engine = 'AggregatingMergeTree' AND sorting_key = 'endpoint, hour'
+              FROM system.tables WHERE database = 'metrics' AND name = 'hourly')
+    show: SELECT concat(name, ' ', type) FROM system.columns WHERE database = 'metrics' AND table = 'hourly' ORDER BY position
+
+  - name: metrics.hourly_mv writes TO metrics.hourly with -State functions
+    type: sql_true
+    points: 15
+    query: |
+      SELECT engine = 'MaterializedView' AND match(create_table_query, 'TO metrics\\.hourly\\b')
+             AND positionCaseInsensitive(as_select, 'uniqState') > 0 AND positionCaseInsensitive(as_select, 'avgState') > 0
+      FROM system.tables WHERE database = 'metrics' AND name = 'hourly_mv'
+    hint: The view must store partial states, e.g. uniqState(user_id) AS users, avgState(latency_ms) AS avg_latency.
+
+  - name: Historical rows included (backfill)
+    type: result
+    points: 20
+    query: |
+      SELECT count() AS hours, sum(u) AS users
+      FROM (SELECT endpoint, hour, uniqMerge(users) AS u FROM metrics.hourly WHERE endpoint != '/chlab-probe' GROUP BY endpoint, hour)
+    expect: |
+      SELECT count() AS hours, sum(u) AS users
+      FROM (SELECT endpoint, toStartOfHour(ts) AS hour, uniq(user_id) AS u FROM metrics.requests WHERE endpoint != '/chlab-probe' GROUP BY endpoint, hour)
+    tolerance: 0.001
+
+  - name: New inserts are aggregated correctly
+    type: sql_true
+    points: 15
+    prepare:
+      - INSERT INTO metrics.requests SELECT toDateTime('2025-08-20 10:05:00'), '/chlab-probe', number % 3, 100 FROM numbers(6)
+      - INSERT INTO metrics.requests SELECT toDateTime('2025-08-20 10:45:00'), '/chlab-probe', 10 + number, 400 FROM numbers(2)
+    query: |
+      SELECT uniqMerge(users) = 5 AND avgMerge(avg_latency) = 175 FROM metrics.hourly WHERE endpoint = '/chlab-probe'
+    show: |
+      SELECT concat('users ', toString(uniqMerge(users)), ', avg ', toString(avgMerge(avg_latency))) FROM metrics.hourly WHERE endpoint = '/chlab-probe'
+    cleanup:
+      - DELETE FROM metrics.hourly WHERE endpoint = '/chlab-probe'
+      - DELETE FROM metrics.requests WHERE endpoint = '/chlab-probe'
+
+  - name: answers.checkout_hourly gives hour, users, avg_latency for 2025-08-15
+    type: result
+    points: 30
+    tolerance: 0.001
+    query: SELECT hour, users, avg_latency FROM answers.checkout_hourly
+    expect: |
+      SELECT toStartOfHour(ts) AS hour, uniq(user_id) AS users, avg(latency_ms) AS avg_latency
+      FROM metrics.requests WHERE endpoint = '/checkout' AND toDate(ts) = '2025-08-15'
+      GROUP BY hour ORDER BY hour
+    hint: Read states back with uniqMerge(users) and avgMerge(avg_latency), and GROUP BY hour.
+
+solution: |
+  CREATE TABLE metrics.hourly
+  (
+      hour        DateTime,
+      endpoint    LowCardinality(String),
+      users       AggregateFunction(uniq, UInt64),
+      avg_latency AggregateFunction(avg, UInt32)
+  )
+  ENGINE = AggregatingMergeTree
+  ORDER BY (endpoint, hour);
+
+  CREATE MATERIALIZED VIEW metrics.hourly_mv TO metrics.hourly AS
+  SELECT toStartOfHour(ts) AS hour, endpoint,
+         uniqState(user_id) AS users, avgState(latency_ms) AS avg_latency
+  FROM metrics.requests
+  GROUP BY hour, endpoint;
+
+  INSERT INTO metrics.hourly
+  SELECT toStartOfHour(ts) AS hour, endpoint, uniqState(user_id), avgState(latency_ms)
+  FROM metrics.requests
+  GROUP BY hour, endpoint;
+
+  CREATE VIEW answers.checkout_hourly AS
+  SELECT hour, uniqMerge(users) AS users, avgMerge(avg_latency) AS avg_latency
+  FROM metrics.hourly
+  WHERE endpoint = '/checkout' AND toDate(hour) = '2025-08-15'
+  GROUP BY hour
+  ORDER BY hour;
+
+wrong_solutions:
+  - name: view forgets -Merge and GROUP BY (finalizeAggregation per row)
+    must_fail:
+      - answers.checkout_hourly gives hour, users, avg_latency for 2025-08-15
+    sql: |
+      CREATE TABLE metrics.hourly (hour DateTime, endpoint LowCardinality(String), users AggregateFunction(uniq, UInt64),
+        avg_latency AggregateFunction(avg, UInt32)) ENGINE = AggregatingMergeTree ORDER BY (endpoint, hour);
+      CREATE MATERIALIZED VIEW metrics.hourly_mv TO metrics.hourly AS
+      SELECT toStartOfHour(ts) AS hour, endpoint, uniqState(user_id) AS users, avgState(latency_ms) AS avg_latency
+      FROM metrics.requests GROUP BY hour, endpoint;
+      INSERT INTO metrics.hourly (hour, endpoint, users, avg_latency) SELECT toStartOfHour(ts), endpoint, uniqState(user_id), avgState(latency_ms)
+      FROM metrics.requests WHERE cityHash64(user_id) % 2 = 0 GROUP BY 1, 2;
+      INSERT INTO metrics.hourly (hour, endpoint, users, avg_latency) SELECT toStartOfHour(ts), endpoint, uniqState(user_id), avgState(latency_ms)
+      FROM metrics.requests WHERE cityHash64(user_id) % 2 = 1 GROUP BY 1, 2;
+      CREATE VIEW answers.checkout_hourly AS
+      SELECT hour, finalizeAggregation(users) AS users, finalizeAggregation(avg_latency) AS avg_latency
+      FROM metrics.hourly WHERE endpoint = '/checkout' AND toDate(hour) = '2025-08-15' ORDER BY hour;
+  - name: no backfill
+    must_fail:
+      - Historical rows included (backfill)
+    sql: |
+      CREATE TABLE metrics.hourly (hour DateTime, endpoint LowCardinality(String), users AggregateFunction(uniq, UInt64),
+        avg_latency AggregateFunction(avg, UInt32)) ENGINE = AggregatingMergeTree ORDER BY (endpoint, hour);
+      CREATE MATERIALIZED VIEW metrics.hourly_mv TO metrics.hourly AS
+      SELECT toStartOfHour(ts) AS hour, endpoint, uniqState(user_id) AS users, avgState(latency_ms) AS avg_latency
+      FROM metrics.requests GROUP BY hour, endpoint;
+      CREATE VIEW answers.checkout_hourly AS
+      SELECT hour, uniqMerge(users) AS users, avgMerge(avg_latency) AS avg_latency
+      FROM metrics.hourly WHERE endpoint = '/checkout' AND toDate(hour) = '2025-08-15' GROUP BY hour ORDER BY hour;

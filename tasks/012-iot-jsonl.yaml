@@ -1,0 +1,120 @@
+id: 12
+slug: iot-jsonl
+title: Model sensor readings from JSON lines
+domains: [modeling, inserting]
+objectives: [M2, M3, M4, I1, I3]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/interfaces/formats/JSONEachRow
+  - https://clickhouse.com/docs/sql-reference/data-types/uuid
+  - https://clickhouse.com/docs/sql-reference/data-types/ipv4
+  - https://clickhouse.com/docs/sql-reference/data-types/datetime64
+
+brief: |
+  /data/readings.jsonl holds sensor readings, one JSON object per line, with
+  these keys: device_id (a UUID), ip (an IPv4 address), reading_ts (with
+  milliseconds), temperature, status ('ok', 'warn' or 'fail') and battery
+  (a percentage, 0-100).
+
+  1. Create a database iot and a MergeTree table iot.readings with one
+  column per key, same names. Use the most specific, efficient type for each:
+  a real UUID type, a real IPv4 type, millisecond timestamps, a 4-byte float
+  for temperature, a type that stores status compactly, and the smallest
+  integer that holds a percentage. Nothing Nullable.
+
+  2. Queries always filter on one device_id and a time range: choose the
+  sort order accordingly.
+
+  3. Load the file.
+
+reset:
+  - DROP DATABASE IF EXISTS iot SYNC
+
+files:
+  - path: readings.jsonl
+    format: JSONEachRow
+    query: |
+      SELECT
+          reinterpretAsUUID(concat(reinterpretAsString(cityHash64(d, {seed}, 1)), reinterpretAsString(cityHash64(d, {seed}, 2)))) AS device_id,
+          toIPv4(concat('10.', toString(d % 256), '.', toString(intDiv(d, 256) % 256), '.', toString(1 + cityHash64(d, {seed}, 3) % 254))) AS ip,
+          toDateTime64('2025-07-01 00:00:00', 3) + toIntervalMillisecond(cityHash64(number, {seed}, 4) % (14 * 86400000)) AS reading_ts,
+          round(15 + (cityHash64(number, {seed}, 5) % 3000) / 100, 2) AS temperature,
+          ['ok', 'ok', 'ok', 'ok', 'warn', 'fail'][1 + (cityHash64(number, {seed}, 6) % 6)] AS status,
+          toUInt8(cityHash64(number, {seed}, 7) % 101) AS battery
+      FROM (SELECT number, cityHash64(number, {seed}, 0) % 400 AS d FROM numbers(200000))
+
+checks:
+  - name: Specific, efficient types
+    type: column_types
+    points: 40
+    table: iot.readings
+    columns:
+      device_id: ['UUID']
+      ip: ['IPv4']
+      reading_ts: ['DateTime64\(3\)', "DateTime64\\(3, '[^']*'\\)"]
+      temperature: ['Float32']
+      status: ['LowCardinality\(String\)', 'Enum8\(.*\)']
+      battery: ['UInt8']
+    hint: >-
+      JSON inference picks String, Nullable and 64-bit types. UUID and IPv4 store 16 and 4 bytes
+      instead of 36 and up to 15 characters.
+
+  - name: Sorted by device_id, then reading_ts
+    type: sql_true
+    points: 20
+    query: |
+      SELECT engine = 'MergeTree' AND match(sorting_key, '^device_id, [^,]*reading_ts')
+      FROM system.tables WHERE database = 'iot' AND name = 'readings'
+    show: SELECT concat(engine, ' ORDER BY ', sorting_key) FROM system.tables WHERE database = 'iot' AND name = 'readings'
+
+  - name: All readings loaded, values intact
+    type: result
+    points: 40
+    query: |
+      SELECT count() AS rows, groupBitXor(cityHash64(toString(device_id), toString(ip), toString(reading_ts), toString(status), battery)) AS fp,
+             sum(round(temperature * 100)) AS t
+      FROM iot.readings
+    expect: |
+      SELECT count() AS rows, groupBitXor(cityHash64(device_id, ip, reading_ts, status, battery)) AS fp,
+             sum(round(temperature * 100)) AS t
+      FROM file('readings.jsonl', 'JSONEachRow',
+                'device_id String, ip String, reading_ts String, temperature Float64, status String, battery UInt8')
+
+solution: |
+  DESCRIBE file('readings.jsonl', 'JSONEachRow');
+
+  CREATE DATABASE iot;
+
+  CREATE TABLE iot.readings
+  (
+      device_id   UUID,
+      ip          IPv4,
+      reading_ts  DateTime64(3),
+      temperature Float32,
+      status      Enum8('ok' = 1, 'warn' = 2, 'fail' = 3),
+      battery     UInt8
+  )
+  ENGINE = MergeTree
+  ORDER BY (device_id, reading_ts);
+
+  INSERT INTO iot.readings FROM INFILE '/data/readings.jsonl' FORMAT JSONEachRow;
+
+alternatives:
+  - name: LowCardinality status, INSERT SELECT from file()
+    sql: |
+      CREATE DATABASE iot;
+      CREATE TABLE iot.readings (device_id UUID, ip IPv4, reading_ts DateTime64(3), temperature Float32,
+        status LowCardinality(String), battery UInt8) ENGINE = MergeTree ORDER BY (device_id, reading_ts);
+      INSERT INTO iot.readings SELECT * FROM file('readings.jsonl', 'JSONEachRow');
+
+wrong_solutions:
+  - name: strings everywhere, time-first key
+    must_fail:
+      - Specific, efficient types
+      - Sorted by device_id, then reading_ts
+    sql: |
+      CREATE DATABASE iot;
+      CREATE TABLE iot.readings (device_id String, ip String, reading_ts DateTime64(3), temperature Float64,
+        status String, battery Int64) ENGINE = MergeTree ORDER BY (reading_ts, device_id);
+      INSERT INTO iot.readings FROM INFILE '/data/readings.jsonl' FORMAT JSONEachRow;

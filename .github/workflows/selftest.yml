@@ -1,0 +1,22 @@
+name: selftest
+
+# Proves every task is gradable: reference and alternative solutions score 100%,
+# and every known-wrong solution fails the checks it names.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: chlab up
+      - run: chlab selftest
+      - if: failure()
+        run: docker compose logs clickhouse | tail -100

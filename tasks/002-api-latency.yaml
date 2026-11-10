@@ -1,0 +1,205 @@
+id: 2
+slug: api-latency
+title: API latency per 15-minute bucket
+domains: [analyzing]
+objectives: [A1, A2, A3, A4]
+tier: 2
+minutes: 12
+docs:
+  - https://clickhouse.com/docs/sql-reference/functions/date-time-functions
+  - https://clickhouse.com/docs/sql-reference/functions/string-search-functions
+  - https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/quantile
+
+brief: |
+  The table web.logs holds two weeks of web server access logs (one row per
+  request). The table is already loaded. Explore it before writing your query.
+
+  The on-call team wants a latency report for 14 March 2025 (the whole
+  calendar day, server time), covering only API traffic: requests whose url
+  contains the substring /api/ (lowercase; the match is case-sensitive).
+
+  Save your answer as a view named answers.api_p95 that returns one row per
+  15-minute interval of that day, ordered from earliest to latest, with exactly
+  these three columns in this order:
+
+    bucket    the start of the 15-minute interval (a DateTime)
+    requests  the number of API requests in that interval
+    p95_ms    the 95th percentile of response_ms in that interval
+
+  The database answers already exists. You can create the view with
+  CREATE VIEW answers.api_p95 AS SELECT ...
+
+reset:
+  - DROP DATABASE IF EXISTS web SYNC
+  - CREATE DATABASE IF NOT EXISTS answers
+  - DROP VIEW IF EXISTS answers.api_p95 SYNC
+
+setup:
+  - CREATE DATABASE web
+  - |
+    CREATE TABLE web.logs
+    (
+        ts          DateTime,
+        method      LowCardinality(String),
+        url         String,
+        status      UInt16,
+        response_ms UInt32,
+        user_agent  LowCardinality(String)
+    )
+    ENGINE = MergeTree
+    ORDER BY ts
+  - |
+    INSERT INTO web.logs
+    SELECT
+        toDateTime('2025-03-08 00:00:00') + (cityHash64(number, {seed}, 1) % (14 * 86400)) AS ts,
+        ['GET', 'GET', 'GET', 'GET', 'POST', 'POST', 'PUT', 'DELETE'][1 + (cityHash64(number, {seed}, 2) % 8)] AS method,
+        concat(['/api/v1/orders', '/api/v1/users', '/api/v2/search', '/static/app.js', '/static/logo.png',
+                '/home', '/checkout', '/API/v1/legacy', '/docs/api/', '/v1/api-health'][1 + (cityHash64(number, {seed}, 3) % 10)],
+               '?id=', toString(cityHash64(number, {seed}, 4) % 5000)) AS url,
+        [200, 200, 200, 200, 200, 200, 201, 204, 301, 404, 429, 500, 503][1 + (cityHash64(number, {seed}, 5) % 13)] AS status,
+        toUInt32(4 + pow((cityHash64(number, {seed}, 6) % 10000) / 10000, 4) * 2400
+                 + (cityHash64(number, {seed}, 7) % 40)) AS response_ms,
+        ['Mozilla/5.0', 'curl/8.5.0', 'python-requests/2.32', 'Go-http-client/1.1'][1 + (cityHash64(number, {seed}, 8) % 4)] AS user_agent
+    FROM numbers(1200000)
+
+checks:
+  - name: answers.api_p95 exists and is a view
+    type: sql_true
+    points: 5
+    query: SELECT engine = 'View' FROM system.tables WHERE database = 'answers' AND name = 'api_p95'
+    show: SELECT engine FROM system.tables WHERE database = 'answers' AND name = 'api_p95'
+    hint: CREATE VIEW answers.api_p95 AS SELECT ...
+
+  - name: Columns are bucket, requests, p95_ms (in that order)
+    type: sql_true
+    points: 10
+    query: |
+      SELECT groupArray(name) = ['bucket', 'requests', 'p95_ms']
+      FROM (SELECT name FROM system.columns WHERE database = 'answers' AND table = 'api_p95' ORDER BY position)
+    show: SELECT name FROM system.columns WHERE database = 'answers' AND table = 'api_p95' ORDER BY position
+    hint: Alias each expression, e.g. count() AS requests.
+
+  - name: bucket is a DateTime at the start of each 15-minute interval
+    type: sql_true
+    points: 10
+    query: |
+      SELECT toTypeName(bucket) LIKE 'DateTime%' AND countIf(toMinute(bucket) % 15 != 0 OR toSecond(bucket) != 0) = 0
+      FROM answers.api_p95
+    hint: toStartOfFifteenMinutes(ts) or toStartOfInterval(ts, INTERVAL 15 MINUTE).
+
+  - name: One row per interval of 14 March 2025, in time order
+    type: result
+    points: 20
+    query: SELECT bucket FROM answers.api_p95
+    expect: |
+      SELECT toStartOfFifteenMinutes(ts) AS bucket FROM web.logs
+      WHERE toDate(ts) = '2025-03-14' AND position(url, '/api/') > 0
+      GROUP BY bucket ORDER BY bucket
+    hint: Filter on the calendar day (toDate(ts) = '2025-03-14'), group by the bucket, and ORDER BY it.
+
+  - name: requests counts exactly the API requests in each interval
+    type: result
+    points: 30
+    ordered: false
+    query: SELECT bucket, requests FROM answers.api_p95
+    expect: |
+      SELECT toStartOfFifteenMinutes(ts) AS bucket, count() AS requests FROM web.logs
+      WHERE toDate(ts) = '2025-03-14' AND position(url, '/api/') > 0
+      GROUP BY bucket
+    hint: >-
+      The match is case-sensitive: /API/v1/legacy does not count, but /docs/api/ does.
+      LIKE '%/api/%' and position(url, '/api/') > 0 are both case-sensitive; ILIKE is not.
+
+  # Any quantile function is acceptable (quantile, quantileExact, quantileTDigest...),
+  # so the value only has to sit between the exact 94th and 96th percentiles.
+  - name: p95_ms is the 95th percentile per interval
+    type: sql_true
+    points: 25
+    query: |
+      SELECT count() > 0 AND countIf(NOT (a.p95_ms BETWEEN t.lo AND t.hi)) = 0
+      FROM answers.api_p95 AS a
+      INNER JOIN
+      (
+          SELECT toStartOfFifteenMinutes(ts) AS bucket,
+                 quantileExactLow(0.94)(response_ms) AS lo, quantileExactHigh(0.96)(response_ms) AS hi
+          FROM web.logs WHERE toDate(ts) = '2025-03-14' AND position(url, '/api/') > 0
+          GROUP BY bucket
+      ) AS t ON a.bucket = t.bucket
+    show: |
+      SELECT concat(toString(a.bucket), ' → ', toString(round(a.p95_ms, 1)), ' (expected about ', toString(t.p95), ')')
+      FROM answers.api_p95 AS a
+      INNER JOIN
+      (
+          SELECT toStartOfFifteenMinutes(ts) AS bucket, quantileExact(0.95)(response_ms) AS p95,
+                 quantileExactLow(0.94)(response_ms) AS lo, quantileExactHigh(0.96)(response_ms) AS hi
+          FROM web.logs WHERE toDate(ts) = '2025-03-14' AND position(url, '/api/') > 0
+          GROUP BY bucket
+      ) AS t ON a.bucket = t.bucket
+      WHERE NOT (a.p95_ms BETWEEN t.lo AND t.hi)
+      LIMIT 3
+    hint: quantile(0.95)(response_ms). Note the two sets of brackets, the level first.
+
+solution: |
+  -- Explore first
+  DESCRIBE web.logs;
+  SELECT * FROM web.logs LIMIT 5;
+  SELECT DISTINCT cutQueryString(url) AS path FROM web.logs ORDER BY path;
+
+  CREATE VIEW answers.api_p95 AS
+  SELECT
+      toStartOfFifteenMinutes(ts)   AS bucket,
+      count()                       AS requests,
+      quantile(0.95)(response_ms)   AS p95_ms
+  FROM web.logs
+  WHERE toDate(ts) = '2025-03-14'
+    AND url LIKE '%/api/%'
+  GROUP BY bucket
+  ORDER BY bucket;
+
+  SELECT * FROM answers.api_p95 LIMIT 5;
+
+wrong_solutions:
+  - name: case-insensitive match
+    must_fail:
+      - requests counts exactly the API requests in each interval
+    sql: |
+      CREATE VIEW answers.api_p95 AS
+      SELECT toStartOfFifteenMinutes(ts) AS bucket, count() AS requests, quantile(0.95)(response_ms) AS p95_ms
+      FROM web.logs WHERE toDate(ts) = '2025-03-14' AND url ILIKE '%/api/%'
+      GROUP BY bucket ORDER BY bucket;
+  - name: hourly buckets, unordered, median
+    must_fail:
+      - bucket is a DateTime at the start of each 15-minute interval
+      - One row per interval of 14 March 2025, in time order
+      - p95_ms is the 95th percentile per interval
+    sql: |
+      CREATE VIEW answers.api_p95 AS
+      SELECT toStartOfHour(ts) + 1 AS bucket, count() AS requests, median(response_ms) AS p95_ms
+      FROM web.logs WHERE toDate(ts) = '2025-03-14' AND position(url, '/api/') > 0
+      GROUP BY bucket;
+  - name: prefix match only, wrong column names
+    must_fail:
+      - Columns are bucket, requests, p95_ms (in that order)
+      - requests counts exactly the API requests in each interval
+    sql: |
+      CREATE VIEW answers.api_p95 AS
+      SELECT toStartOfFifteenMinutes(ts) AS bucket, count() AS cnt, quantile(0.95)(response_ms) AS p95
+      FROM web.logs WHERE toDate(ts) = '2025-03-14' AND startsWith(url, '/api/')
+      GROUP BY bucket ORDER BY bucket;
+
+alternatives:
+  - name: toStartOfInterval, position(), quantileTDigest, date range
+    sql: |
+      CREATE VIEW answers.api_p95 AS
+      SELECT toStartOfInterval(ts, INTERVAL 15 MINUTE) AS bucket, count() AS requests,
+             quantileTDigest(0.95)(response_ms) AS p95_ms
+      FROM web.logs
+      WHERE ts >= '2025-03-14 00:00:00' AND ts < '2025-03-15 00:00:00' AND position(url, '/api/') > 0
+      GROUP BY bucket ORDER BY bucket ASC;
+  - name: quantileExact and match()
+    sql: |
+      CREATE VIEW answers.api_p95 AS
+      SELECT toStartOfFifteenMinutes(ts) AS bucket, countIf(match(url, '/api/')) AS requests,
+             quantileExactIf(0.95)(response_ms, match(url, '/api/')) AS p95_ms
+      FROM web.logs WHERE toDate(ts) = toDate('2025-03-14')
+      GROUP BY bucket HAVING requests > 0 ORDER BY bucket;
