@@ -121,7 +121,7 @@ def build(out: Path) -> None:
 <style>{CSS}</style>
 </head>
 <body><main>
-<h1>Passing<span>MergeTree</span></h1>
+<h1>ClickHouse<span>DevLab</span></h1>
 <p class="lead">Free, hands-on practice for the ClickHouse Certified Developer exam, in the same tool the exam uses:
 <code>clickhouse-client</code>. Fresh data every attempt, a grader that checks your database and explains what is wrong,
 and timed mock exams.</p>
