@@ -9,10 +9,10 @@ description = "Hands-on ClickHouse certification practice — 36 auto-graded tas
 authors = [{name = "Hannah Igboke", email = "danielhannah663@gmail.com"}]
 license = {text = "MIT"}
 requires-python = ">=3.11"
-dependencies = ["click>=8", "pyyaml>=6", "docker>=7", "watchdog>=4"]
+dependencies = ["click>=8", "pyyaml>=6"]
 
 [project.scripts]
-chlab = "chlab.cli:cli"
+chlab = "chlab.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["chlab*"]
