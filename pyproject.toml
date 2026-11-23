@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "clickhouse-dev-lab"
 version = "1.0.0"
 description = "Hands-on ClickHouse certification practice — 36 auto-graded tasks, real clickhouse-client"
-authors = [{name = "Hannah Igboke", email = "danielhannah663@gmail.com"}]
+authors = [{name = "Hannah Igboke"}]
 license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = ["click>=8", "pyyaml>=6"]
